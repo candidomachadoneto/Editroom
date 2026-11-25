@@ -27,6 +27,9 @@ enum VoiceBridgeState: Equatable {
 @MainActor
 final class VoiceBridge: ObservableObject {
     static let shared = VoiceBridge()
+    /// Posted whenever live speaker monitor audio should duck (assistant or user speaking) or restore (1.0).
+    /// Affects ONLY speaker output in `AudioStream`; NEVER modifies project or export audio levels.
+    static let monitorDuckNotification = Notification.Name("EditroomVoiceMonitorDuck")
 
     @Published private(set) var state: VoiceBridgeState = .idle
     @Published private(set) var liveSubtitle: String = ""
@@ -65,6 +68,10 @@ final class VoiceBridge: ObservableObject {
 
     private var activeSession = false
     private var responseInProgress = false
+    private var assistantSpeaking = false
+    private var userSpeaking = false
+    private var userSpeechReleaseTask: Task<Void, Never>?
+    private var lastPostedMonitorGain: Float = 1.0
     private var reconnectedOnce = false
     private var prewarmed = false
     private var healthTimer: Timer?
@@ -171,11 +178,15 @@ final class VoiceBridge: ObservableObject {
         }
     }
 
-    /// Cancels any in-flight multi-model plans, closes mic & WebSocket, and returns cleanly to `.idle`.
+    /// Cancels any in-flight multi-model plans, closes mic & WebSocket, restores monitor volume, and returns cleanly to `.idle`.
     func stop() {
         sessionGeneration += 1
         activeSession = false
         responseInProgress = false
+        assistantSpeaking = false
+        userSpeaking = false
+        userSpeechReleaseTask?.cancel()
+        userSpeechReleaseTask = nil
         reconnectedOnce = false
         activeTeamStatus = nil
         coordinator.cancelAll()
@@ -183,6 +194,30 @@ final class VoiceBridge: ObservableObject {
         realtime.disconnect()
         liveSubtitle = ""
         state = .idle
+        updateMonitorDuck()
+    }
+
+    /// Automatically ducks ONLY live speaker monitoring in `AudioStream` while the voice director or user is speaking.
+    /// Never modifies project clips, track gains, or exported audio.
+    private func updateMonitorDuck() {
+        let targetGain: Float
+        if !activeSession {
+            targetGain = 1.0
+        } else if assistantSpeaking {
+            targetGain = 0.12
+        } else if userSpeaking || responseInProgress {
+            targetGain = 0.18
+        } else {
+            targetGain = 1.0
+        }
+        guard abs(targetGain - lastPostedMonitorGain) > 0.005 else { return }
+        lastPostedMonitorGain = targetGain
+        VoiceLog.info("Monitor duck -> \(String(format: "%.2f", targetGain)) (assistant=\(assistantSpeaking) user=\(userSpeaking) resp=\(responseInProgress))")
+        NotificationCenter.default.post(
+            name: Self.monitorDuckNotification,
+            object: nil,
+            userInfo: ["gain": targetGain]
+        )
     }
 
     func shutdown() {
@@ -230,13 +265,14 @@ final class VoiceBridge: ObservableObject {
             : "RESUMO ATUAL DA TIMELINE (pré-carregado; use direto ou chame get_state se acabou de mudar):\n\(cachedStateCompact)"
 
         return """
-        Você é o Diretor de Voz do Mafinha no Editroom. Fale sempre em português do Brasil, de forma ultra-rápida, natural e direta.
-        - Para comandos diretos (cortar, desfazer, dar play, ajustar cor, áudio, enquadramento, títulos, legendas): chame exec_edit IMEDIATAMENTE sem pedir confirmação.
-        - Para pedidos complexos, criativos, multi-frente, ou quando o usuário citar modelos (ex.: "usa Gemini com Claude", "junta os modelos"): avise em 3 palavras ("Chamando a equipe agora") e chame orchestrate_models(goal, models).
+        Você é o Diretor de Voz do Mafinha no Editroom-Pro. Fale sempre em português do Brasil, de forma ultra-rápida, natural e direta.
+        - REGRA DE VELOCIDADE: Para quase TODAS as edições (cortar, desfazer, dar play, enquadrar, recortar com set_crop, separar apresentador embaixo e prints em cima em V1+V2, recorte IA de fundo, card polish, cor, áudio, títulos, legendas, remover silêncios), chame exec_edit IMEDIATAMENTE usando múltiplas lanes paralelas (cursores coloridos ao vivo, <0.5s!) sem pedir confirmação.
+        - Use orchestrate_models(goal, models) quando o usuário pedir expressamente para usar ou combinar modelos (ex.: "usa Gemini com Claude", "chama os agentes especialistas", "junta os modelos") OU em planejamentos criativos grandes de várias etapas. Antes de chamar orchestrate_models, diga em 3 palavras ("Chamando a equipe agora").
         - Modelos disponíveis na equipe ativa: [\(teamNames)].
+        - ATENÇÃO SOBRE ÁUDIO: O som do vídeo nos alto-falantes já abaixa automaticamente quando você ou o Mafinha falam (monitor ducking). NUNCA mute o áudio do projeto nem chame set_audio gain_db=-60 só para conseguir conversar, a menos que o usuário peça explicitamente para mutar a track do projeto!
         - Quando o usuário disser uma preferência ("gostei assim", "sempre deixa o título no topo", "neste vídeo sem zoom"): chame remember_preference diferenciando scope "global" (sempre) de "project" (só este vídeo). Se pedir para esquecer, chame forget_preference.
         - Responda sempre em 1 frase curta e natural confirmando o que foi feito. NUNCA leia JSON, caminhos de arquivo, IDs ou UUIDs.
-        - Peça confirmação falada só antes de export que sobrescreva arquivo ou de apagar um trecho grande. Se algo falhar, diga em 1 frase e ofereça desfazer ou tentar de novo.
+        - Peça confirmação falada só antes de export que sobrescreva arquivo ou de apagar um trecho grande. Se algo falhar, diga em 1 frase o que falhou e ofereça desfazer ou tentar de novo.
 
         PROTOCOLO EDITDSL (exec_edit):
         - "pace": 0.3 é OBRIGATÓRIO (nunca 0.0).
@@ -244,9 +280,12 @@ final class VoiceBridge: ObservableObject {
         - Agentes pré-aquecidos: Grok-Diretor, Grok-Cortador, Grok-Prints, Grok-Titulos, Grok-Colorista, Grok-Audio.
         - Nunca coloque duas lanes no mesmo trecho da mesma track nem ripple: true em paralelo na mesma track.
         - Seletores em target: all_v1, all_v2, all_a1, all_video, all_audio, all_titles, track:V1, track:V2, track:V3, playhead, playhead:V1, at:SEGUNDOS:TRACK, range:INICIO-FIM:TRACK.
-        - Tools com clip_ids (set_grade, delete_clips): use "id_field": "clip_ids".
+        - NUNCA coloque "target" em add_track, add_clip, add_title, add_solid, set_sequence, playback ou history!
+        - Tools com clip_ids (set_grade, delete_clips, remove_silences): use "id_field": "clip_ids".
         - Atalhos (pace 0.3): Desfazer -> Grok-Diretor history {action:"undo"}; Tocar -> Grok-Diretor playback {action:"play", time:S}; Cor -> Grok-Colorista all_v1 set_grade id_field:"clip_ids" {look:"Teal and orange", look_intensity:0.35}; Polir áudio -> Grok-Audio all_a1 set_audio {gain_db:2.0, fade_in:0.12, fade_out:0.12}; Enquadrar Kim -> Grok-Diretor all_v1 set_transform {scale:2.58, x:0.87, y:0.30}.
-        - Projeto típico: TikTok 9:16 1080x1920 60fps; V1 Kim (scale 2.58, x 0.87, y 0.30), V2 prints (scale 1.56, x -0.28, y -0.17), V3 títulos topo (y 0.055), A1 áudio + legendas (position 0.77).
+        - Projeto típico: TikTok 9:16 1080x1920 60fps; V1 apresentador embaixo (y positivo, ex: scale 2.58, x 0.87, y 0.30), V2 prints/matérias em cima (y negativo, ex: scale 1.56, x -0.28, y -0.17 + set_crop + set_clip_style cardPolish), V3 títulos topo (y 0.055), A1 áudio + legendas (position 0.77).
+
+        \(MultiModelCoordinator.editDSLToolReference)
 
         \(tasteBlock)
 
@@ -308,11 +347,13 @@ final class VoiceBridge: ObservableObject {
         audio.onPlaybackStateChanged = { [weak self] isPlaying in
             Task { @MainActor [weak self] in
                 guard let self, self.activeSession else { return }
+                self.assistantSpeaking = isPlaying
                 if isPlaying {
                     self.state = .speaking
                 } else if case .speaking = self.state {
                     self.state = .listening
                 }
+                self.updateMonitorDuck()
             }
         }
 
@@ -337,23 +378,39 @@ final class VoiceBridge: ObservableObject {
             // Instant barge-in: stop local playback immediately; only send response.cancel if a response is actually active!
             guard activeSession else { return }
             audio.interruptPlayback()
+            assistantSpeaking = false
+            userSpeechReleaseTask?.cancel()
+            userSpeechReleaseTask = nil
+            userSpeaking = true
             if responseInProgress {
                 realtime.cancelResponse()
                 responseInProgress = false
             }
             liveSubtitle = ""
             state = .listening
+            updateMonitorDuck()
 
         case .speechStopped:
             VoiceLog.info("VAD speech_stopped")
+            guard activeSession else { return }
+            let gen = sessionGeneration
+            userSpeechReleaseTask?.cancel()
+            userSpeechReleaseTask = Task { @MainActor [weak self] in
+                try? await Task.sleep(nanoseconds: 550_000_000)
+                guard let self, self.activeSession, self.sessionGeneration == gen else { return }
+                self.userSpeaking = false
+                self.updateMonitorDuck()
+            }
 
         case .responseStarted:
             VoiceLog.info("Response started")
             responseInProgress = true
+            updateMonitorDuck()
 
         case .responseDone:
             VoiceLog.info("Response done")
             responseInProgress = false
+            updateMonitorDuck()
 
         case .audioDelta(let pcmData):
             guard activeSession else { return }
@@ -427,17 +484,20 @@ final class VoiceBridge: ObservableObject {
             case "exec_edit":
                 let parsed = (try? JSONSerialization.jsonObject(with: Data(argumentsJSON.utf8)) as? [String: Any]) ?? [:]
                 let payload = (parsed["payload"] as? [String: Any]) ?? parsed
+                VoiceLog.info("exec_edit payload: \(String(argumentsJSON.prefix(400)))")
                 guard activeSession, sessionGeneration == generation else { return }
                 let resultStr = try await swarm.execEdit(payload: payload)
+                VoiceLog.info("exec_edit result: \(String(resultStr.prefix(350)))")
                 guard activeSession, sessionGeneration == generation else { return }
                 realtime.sendFunctionOutput(callID: callID, outputJSON: resultStr)
 
                 // Record episodic trace (conservatively marking recent undo without promoting single undo to taste).
                 let sig = Self.toolsSignature(from: payload)
+                let outcome = resultStr.contains("\"status\":\"error\"") ? "error" : "ok"
                 if sig == "history:undo" {
                     taste.markRecentInteractionUndone()
                 } else {
-                    taste.logInteraction(projectID: cachedProjectID, summary: sig, toolsSignature: sig, outcome: "ok")
+                    taste.logInteraction(projectID: cachedProjectID, summary: sig, toolsSignature: sig, outcome: outcome)
                 }
                 await refreshCachedState()
 
@@ -456,9 +516,11 @@ final class VoiceBridge: ObservableObject {
                     swarm: swarm
                 )
                 activeTeamStatus = nil
+                VoiceLog.info("orchestrate_models result: \(String(resultStr.prefix(350)))")
                 guard activeSession, sessionGeneration == generation else { return }
                 realtime.sendFunctionOutput(callID: callID, outputJSON: resultStr)
-                taste.logInteraction(projectID: cachedProjectID, summary: goal, toolsSignature: "team:\(team.map(\.rawValue).joined(separator: "+"))", outcome: "ok")
+                let outcome = resultStr.contains("\"status\":\"error\"") ? "error" : "ok"
+                taste.logInteraction(projectID: cachedProjectID, summary: goal, toolsSignature: "team:\(team.map(\.rawValue).joined(separator: "+"))", outcome: outcome)
                 await refreshCachedState()
 
             case "remember_preference":

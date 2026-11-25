@@ -99,29 +99,49 @@ final class SwarmHTTPClient: @unchecked Sendable {
         out["pace"] = requiredPace
 
         if let rawLanes = input["lanes"] as? [[String: Any]] {
-            out["lanes"] = rawLanes.map { lane -> [String: Any] in
+            out["lanes"] = rawLanes.compactMap { lane -> [String: Any]? in
+                guard let ops = lane["ops"] as? [[String: Any]] else { return nil }
+                let cleanOps = ops.compactMap(normalizeOp)
+                guard !cleanOps.isEmpty else { return nil }
                 var l = lane
                 l["agent"] = canonicalAgent(lane["agent"] as? String)
                 l["pace"] = requiredPace
-                if let ops = lane["ops"] as? [[String: Any]] {
-                    l["ops"] = ops.map(normalizeOp)
-                }
+                l["ops"] = cleanOps
                 return l
             }
         } else if let rawOps = input["ops"] as? [[String: Any]] {
-            let agent = canonicalAgent(input["agent"] as? String)
-            out["lanes"] = [[
-                "agent": agent,
-                "pace": requiredPace,
-                "ops": rawOps.map(normalizeOp),
-            ]]
+            let cleanOps = rawOps.compactMap(normalizeOp)
+            if !cleanOps.isEmpty {
+                let agent = canonicalAgent(input["agent"] as? String)
+                out["lanes"] = [[
+                    "agent": agent,
+                    "pace": requiredPace,
+                    "ops": cleanOps,
+                ]]
+            } else {
+                out["lanes"] = []
+            }
             out.removeValue(forKey: "ops")
             out.removeValue(forKey: "agent")
         }
         return out
     }
 
-    private static func normalizeOp(_ op: [String: Any]) -> [String: Any] {
+    /// Tools that never take a `clip_id` selector target; stripping an accidental `target` prevents the daemon from skipping them.
+    private static let nonTargetTools: Set<String> = [
+        "add_track", "add_clip", "add_title", "add_solid", "set_sequence", "set_track",
+        "playback", "history", "save_project", "apply_news_reel_macro", "auto_edit",
+        "snapshot_frame", "set_marker", "delete_markers", "set_captions", "set_in_out",
+        "export", "list_looks",
+    ]
+
+    /// Tools whose MCP schema expects `clip_ids: [String]` rather than singular `clip_id`.
+    private static let pluralClipIDTools: Set<String> = [
+        "set_grade", "delete_clips", "remove_silences",
+    ]
+
+    private static func normalizeOp(_ op: [String: Any]) -> [String: Any]? {
+        guard let tool = op["tool"] as? String, !tool.isEmpty else { return nil }
         let reserved: Set<String> = [
             "tool", "target", "args", "id_field", "batch_ids", "delay",
             "save_v", "save_a", "save_id", "save_split_v", "save_split_a",
@@ -132,6 +152,34 @@ final class SwarmHTTPClient: @unchecked Sendable {
         for (k, v) in op where !reserved.contains(k) {
             if args[k] == nil { args[k] = v }
             normalized.removeValue(forKey: k)
+        }
+        // Strip invalid/empty targets or targets placed on project/track-level tools so the daemon never silently skips them.
+        if let target = normalized["target"] as? String {
+            let trimmed = target.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.isEmpty || trimmed == "none" || trimmed == "null" || nonTargetTools.contains(tool) {
+                normalized.removeValue(forKey: "target")
+            } else if trimmed.hasPrefix("$") {
+                // Saved variable reference from an earlier op in the same lane: pass via args, not snapshot target.
+                if pluralClipIDTools.contains(tool) {
+                    if args["clip_ids"] == nil { args["clip_ids"] = [trimmed] }
+                } else if args["clip_id"] == nil {
+                    args["clip_id"] = trimmed
+                }
+                normalized.removeValue(forKey: "target")
+            } else if trimmed.range(of: #"^[VvAa]\d+$"#, options: .regularExpression) != nil {
+                // Auto-upgrade bare track name ("V1", "V2", "A1") to valid selector ("track:V2").
+                normalized["target"] = "track:\(trimmed.uppercased())"
+            } else {
+                normalized["target"] = trimmed
+            }
+        }
+        // Auto-fix id_field for plural clip_ids tools when target is used.
+        if normalized["target"] != nil && pluralClipIDTools.contains(tool) && normalized["id_field"] == nil {
+            normalized["id_field"] = "clip_ids"
+        }
+        // If args already explicitly specifies clip_id or clip_ids (e.g. "$v2_clip"), don't overwrite it via target.
+        if args["clip_id"] != nil || args["clip_ids"] != nil {
+            normalized.removeValue(forKey: "target")
         }
         normalized["args"] = args
         if let d = normalized["delay"] as? Double, d <= 0 {

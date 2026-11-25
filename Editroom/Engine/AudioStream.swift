@@ -58,6 +58,9 @@ final class AudioStream: @unchecked Sendable {
         let rate: Double
     }
 
+    /// Notification posted by VoiceBridge to duck ONLY live speaker monitoring (never project/export gain).
+    static let monitorDuckNotification = Notification.Name("EditroomVoiceMonitorDuck")
+
     // Only touched on `queue`.
     private var composition: AVComposition?
     private var mix: AVAudioMix?
@@ -67,6 +70,11 @@ final class AudioStream: @unchecked Sendable {
     private var lanes: [UUID: Lane] = [:]
     /// Which tracks are heard (muted and unsoloed ones aren't); a track not listed is.
     private var audible: [UUID: Bool] = [:]
+    /// Temporary live-monitor ducking multiplier (1.0 = normal, 0.12 = ducked during voice director speech).
+    /// Affects ONLY `AVSampleBufferAudioRenderer.volume` on live speakers — NEVER touches project or export levels.
+    private var monitorDuck: Float = 1.0
+    private var duckRampGeneration: Int = 0
+    private var duckObserver: NSObjectProtocol?
     /// Where each stretch of render time starts, for telling which timeline time is being heard.
     private var stretches: [(render: CMTime, offset: CMTime)] = []
     private var playing = false
@@ -100,6 +108,14 @@ final class AudioStream: @unchecked Sendable {
         t.setEventHandler { [weak self] in self?.pump() }
         t.resume()
         timer = t
+        duckObserver = NotificationCenter.default.addObserver(forName: Self.monitorDuckNotification, object: nil, queue: nil) { [weak self] note in
+            let gain = (note.userInfo?["gain"] as? Float) ?? 1.0
+            self?.setMonitorDuck(gain)
+        }
+    }
+
+    deinit {
+        if let duckObserver { NotificationCenter.default.removeObserver(duckObserver) }
     }
 
     /// The clock the sound plays to; the video players follow it too, so picture and sound never drift.
@@ -135,7 +151,7 @@ final class AudioStream: @unchecked Sendable {
                     if self.playing { self.continueWithNewSound(lane) }
                 } else {
                     let lane = Lane(track: t.track, rate: t.rate)
-                    lane.renderer.volume = self.audible[id] == false ? 0 : 1
+                    lane.renderer.volume = (self.audible[id] == false ? 0 : 1) * self.monitorDuck
                     self.synchronizer.addRenderer(lane.renderer)
                     self.lanes[id] = lane
                     if self.playing { self.join(lane) }
@@ -157,9 +173,42 @@ final class AudioStream: @unchecked Sendable {
     func setAudible(_ audible: [UUID: Bool]) {
         queue.async {
             self.audible = audible
-            for (id, lane) in self.lanes {
-                let volume: Float = audible[id] == false ? 0 : 1
-                if lane.renderer.volume != volume { lane.renderer.volume = volume }
+            self.applyLaneVolumes()
+        }
+    }
+
+    /// Smoothly ducks or restores live speaker monitoring volume (0...1) without altering project or export audio.
+    func setMonitorDuck(_ factor: Float) {
+        let target = max(0, min(1, factor))
+        queue.async {
+            let start = self.monitorDuck
+            guard abs(target - start) > 0.004 else {
+                self.monitorDuck = target
+                self.applyLaneVolumes()
+                return
+            }
+            self.duckRampGeneration += 1
+            let gen = self.duckRampGeneration
+            // Duck fast (80ms) when speech starts; release smoothly (220ms) when speech finishes.
+            let steps = target < start ? 4 : 8
+            let stepMs = target < start ? 20 : 28
+            for step in 1...steps {
+                let frac = Float(step) / Float(steps)
+                let value = start + (target - start) * frac
+                self.queue.asyncAfter(deadline: .now() + .milliseconds(step * stepMs)) { [weak self] in
+                    guard let self, self.duckRampGeneration == gen else { return }
+                    self.monitorDuck = value
+                    self.applyLaneVolumes()
+                }
+            }
+        }
+    }
+
+    private func applyLaneVolumes() {
+        for (id, lane) in lanes {
+            let volume: Float = (audible[id] == false ? 0 : 1) * monitorDuck
+            if abs(lane.renderer.volume - volume) > 0.001 {
+                lane.renderer.volume = volume
             }
         }
     }
