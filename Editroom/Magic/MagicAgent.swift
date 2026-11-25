@@ -98,12 +98,12 @@ final class MagicAgent: ObservableObject {
         }
     }
 
-    /// The program Magic runs is on this Mac: Claude Code, Codex, Gemini CLI or Grok CLI.
+    /// The program Magic runs is on this Mac: Claude Code, Codex, Antigravity/Gemini CLI or Grok CLI.
     func runnable(_ kind: Kind) -> Bool {
         switch kind {
         case .claude: return AgentConnect.shared.claudeCLI != nil
         case .chatgpt: return AgentConnect.shared.codexCLI != nil
-        case .gemini: return AgentConnect.shared.geminiCLI != nil
+        case .gemini: return AgentConnect.shared.preferredGeminiCLI != nil
         case .grok: return AgentConnect.shared.grokCLI != nil
         }
     }
@@ -113,12 +113,142 @@ final class MagicAgent: ObservableObject {
         switch kind {
         case .claude: return AgentConnect.appURL(AgentConnect.claudeBundleID) != nil || AgentConnect.shared.claudeCLI != nil
         case .chatgpt: return AgentConnect.chatgptBundleIDs.contains { AgentConnect.appURL($0) != nil } || AgentConnect.shared.codexCLI != nil
-        case .gemini: return AgentConnect.shared.geminiCLI != nil || FileManager.default.fileExists(atPath: AgentConnect.shared.geminiHome.path)
+        case .gemini: return AgentConnect.shared.preferredGeminiCLI != nil || FileManager.default.fileExists(atPath: AgentConnect.shared.geminiHome.path)
         case .grok: return AgentConnect.appURL(AgentConnect.grokBundleID) != nil || AgentConnect.shared.grokCLI != nil || FileManager.default.fileExists(atPath: AgentConnect.shared.grokHome.path)
         }
     }
 
     // MARK: Model and effort
+
+    @Published private var discoveredModels: [Kind: [ModelOption]] = [:]
+    private var lastModelRefresh: Date?
+    private var modelRefreshTask: Task<Void, Never>?
+
+    /// Queries installed CLIs (`agy models`, `gemini --list-models`, `grok models`) in the background
+    /// so newly launched frontier models appear automatically without rebuilding Editroom.
+    func refreshModels(force: Bool = false) {
+        if !force, let last = lastModelRefresh, Date().timeIntervalSince(last) < 300 { return }
+        lastModelRefresh = Date()
+        modelRefreshTask?.cancel()
+        let agy = AgentConnect.shared.agyCLI
+        let gem = AgentConnect.shared.geminiCLI
+        let grok = AgentConnect.shared.grokCLI
+        let env = Self.environment
+        modelRefreshTask = Task { [weak self] in
+            async let gemList: [ModelOption]? = {
+                if let agy {
+                    let out = await Self.captureCLI(agy, ["models"], env: env)
+                    let parsed = Self.parseAgyGeminiModels(out)
+                    if !parsed.isEmpty { return parsed }
+                }
+                if let gem {
+                    let out = await Self.captureCLI(gem, ["--list-models"], env: env)
+                    let parsed = Self.parseGeminiCLIModels(out)
+                    if !parsed.isEmpty { return parsed }
+                }
+                return nil
+            }()
+            async let grokList: [ModelOption]? = {
+                guard let grok else { return nil }
+                let out = await Self.captureCLI(grok, ["models"], env: env)
+                let parsed = Self.parseGrokModels(out)
+                return parsed.isEmpty ? nil : parsed
+            }()
+            let (gModels, xModels) = await (gemList, grokList)
+            guard !Task.isCancelled, let self else { return }
+            if let gModels { self.discoveredModels[.gemini] = gModels }
+            if let xModels { self.discoveredModels[.grok] = xModels }
+        }
+    }
+
+    private nonisolated static func captureCLI(_ cli: URL, _ args: [String], env: [String: String]) async -> String {
+        await Task.detached(priority: .utility) {
+            let p = Process()
+            p.executableURL = cli
+            p.arguments = args
+            p.environment = env
+            let pipe = Pipe()
+            p.standardOutput = pipe
+            p.standardError = Pipe()
+            do { try p.run() } catch { return "" }
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            p.waitUntilExit()
+            return String(data: data, encoding: .utf8) ?? ""
+        }.value
+    }
+
+    /// Parses `agy models` output (`gemini-4-neon-high\tGemini 4 Neon (High)`) grouped by model family.
+    private nonisolated static func parseAgyGeminiModels(_ text: String) -> [ModelOption] {
+        let effortOrder = ["low", "medium", "high", "xhigh", "max"]
+        var order: [String] = []
+        var names: [String: String] = [:]
+        var effortsByBase: [String: Set<String>] = [:]
+        for line in text.components(separatedBy: .newlines) {
+            let cols = line.split(separator: "\t", maxSplits: 1).map { $0.trimmingCharacters(in: .whitespaces) }
+            guard let rawID = cols.first, rawID.hasPrefix("gemini-"), !rawID.contains("orchestrator") else { continue }
+            var base = rawID
+            var eff = ""
+            for e in effortOrder where rawID.hasSuffix("-\(e)") {
+                base = String(rawID.dropLast(e.count + 1))
+                eff = e
+                break
+            }
+            if !order.contains(base) { order.append(base) }
+            if let label = cols.count > 1 ? cols[1] : nil {
+                let clean = label.replacingOccurrences(of: #"\s*\([^)]*\)\s*$"#, with: "", options: .regularExpression)
+                names[base] = clean
+            }
+            if !eff.isEmpty { effortsByBase[base, default: []].insert(eff) }
+        }
+        return order.map { base in
+            let available = effortOrder.filter { effortsByBase[base]?.contains($0) == true }
+            let blurb: String = if base.contains("carbon") { "Most capable" }
+                else if base.contains("neon") { "Best edits" }
+                else if base.contains("argon") { "Balanced" }
+                else if base.contains("hydrogen") { "Fastest" }
+                else if base.contains("flash") { "Fast" }
+                else { "" }
+            let defEff = available.contains("high") && base.contains("neon") ? "high"
+                : available.contains("low") && base.contains("hydrogen") ? "low"
+                : available.contains("medium") ? "medium" : (available.first ?? "")
+            let fallbackName = base.split(separator: "-").map { $0.prefix(1).uppercased() + $0.dropFirst() }.joined(separator: " ")
+            return ModelOption(id: base, name: names[base] ?? fallbackName, blurb: blurb, efforts: available, defaultEffort: defEff)
+        }
+    }
+
+    /// Parses legacy `gemini --list-models` output.
+    private nonisolated static func parseGeminiCLIModels(_ text: String) -> [ModelOption] {
+        var found: [String] = []
+        for line in text.components(separatedBy: .newlines) {
+            let t = line.trimmingCharacters(in: .whitespaces)
+            guard !t.isEmpty, let first = t.split(separator: " ").first.map(String.init) else { continue }
+            if first == "auto" || first.hasPrefix("gemini-") {
+                if !found.contains(first) { found.append(first) }
+            }
+        }
+        return found.map { id in
+            let name = id == "auto" ? "Auto" : id.split(separator: "-").map { $0.prefix(1).uppercased() + $0.dropFirst() }.joined(separator: " ")
+            let blurb = id == "auto" ? "Recommended" : id.contains("lite") ? "Fastest" : id.contains("flash") ? "Fast" : "Best edits"
+            return ModelOption(id: id, name: name, blurb: blurb, efforts: [], defaultEffort: "")
+        }
+    }
+
+    /// Parses `grok models` output (`* grok-4.7 (default)`, `- grok-4.7-build-fast`, ...).
+    private nonisolated static func parseGrokModels(_ text: String) -> [ModelOption] {
+        var found: [String] = []
+        for line in text.components(separatedBy: .newlines) {
+            let t = line.trimmingCharacters(in: .whitespaces)
+            guard t.hasPrefix("*") || t.hasPrefix("-") else { continue }
+            let rest = t.dropFirst().trimmingCharacters(in: .whitespaces)
+            guard let id = rest.split(separator: " ").first.map(String.init), id.hasPrefix("grok-") else { continue }
+            if !found.contains(id) { found.append(id) }
+        }
+        return found.enumerated().map { idx, id in
+            let name = id.split(separator: "-").map { $0.prefix(1).uppercased() + $0.dropFirst() }.joined(separator: " ")
+            let blurb = idx == 0 ? "Best edits" : id.contains("fast") ? "Fastest" : ""
+            return ModelOption(id: id, name: name, blurb: blurb, efforts: ["low", "medium", "high"], defaultEffort: "low")
+        }
+    }
 
     struct ModelOption: Identifiable, Hashable {
         /// What the program is given.
@@ -144,44 +274,66 @@ final class MagicAgent: ObservableObject {
         }
     }
 
-    /// The models each AI offers. ChatGPT's come from Codex's own list on this Mac.
+    /// The models each AI offers, dynamically synced with each CLI on this Mac when available.
     func models(for kind: Kind) -> [ModelOption] {
         switch kind {
         case .claude:
             let efforts = ["low", "medium", "high", "xhigh", "max"]
             return [
-                ("claude-opus-5-5", "Opus 5.5", "Best edits"), ("claude-sonnet-5-5", "Sonnet 5.5", "Fast"),
-                ("claude-haiku-5-5", "Haiku 5.5", "Fastest"), ("claude-fable-5-2", "Fable 5.2", "Most capable"),
+                ("claude-fable-5-2", "Fable 5.2", "Most capable"),
+                ("claude-opus-5-5", "Opus 5.5", "Best edits"),
+                ("claude-sonnet-5-5", "Sonnet 5.5", "Fast"),
+                ("claude-haiku-5-5", "Haiku 5.5", "Fastest"),
             ].map { ModelOption(id: $0.0, name: $0.1, blurb: $0.2, efforts: efforts) }
         case .chatgpt:
-            // Just these, in this order. Names and efforts come from Codex's own list when it has them.
-            let picks = [("gpt-6.2-sol", "GPT-6.2-Sol"), ("gpt-6.2-astra", "GPT-6.2-Astra"),
-                         ("gpt-6.1-terra", "GPT-6.1-Terra"), ("gpt-6-luna", "GPT-6-Luna")]
+            // Read Codex's live cache so newly launched OpenAI models appear automatically.
             let file = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex/models_cache.json")
-            var known: [String: [String: Any]] = [:]
             if let data = try? Data(contentsOf: file),
-               let models = (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["models"] as? [[String: Any]] {
-                for m in models { if let slug = m["slug"] as? String { known[slug] = m } }
+               let rawModels = (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["models"] as? [[String: Any]] {
+                let live: [ModelOption] = rawModels.compactMap { m in
+                    guard let slug = m["slug"] as? String, slug.hasPrefix("gpt-"), !slug.contains("reserve") else { return nil }
+                    // Hide legacy gpt-5.* if gpt-6+ models are present.
+                    if slug.hasPrefix("gpt-5"), rawModels.contains(where: { ($0["slug"] as? String)?.hasPrefix("gpt-6") == true || ($0["slug"] as? String)?.hasPrefix("gpt-7") == true }) {
+                        return nil
+                    }
+                    let display = (m["display_name"] as? String) ?? slug.uppercased()
+                    let efforts = (m["supported_reasoning_levels"] as? [[String: Any]])?.compactMap { $0["effort"] as? String }.filter { $0 != "ultra" }
+                    let def = m["default_reasoning_level"] as? String ?? "medium"
+                    let blurb = slug.contains("sol") ? "Best edits" : slug.contains("astra") ? "Fast" : slug.contains("luna") ? "Fastest" : ""
+                    return ModelOption(id: slug, name: display, blurb: blurb, efforts: efforts ?? ["low", "medium", "high", "xhigh"], defaultEffort: def)
+                }
+                if !live.isEmpty { return live }
             }
-            return picks.compactMap { slug, name in
-                let m = known[slug]
-                // Not listed by Codex on this Mac: this plan doesn't offer it.
-                if !known.isEmpty, m == nil { return nil }
-                // Not "ultra": it hands parts of the job to more agents, which costs much more.
-                let efforts = (m?["supported_reasoning_levels"] as? [[String: Any]])?.compactMap { $0["effort"] as? String }.filter { $0 != "ultra" }
-                return ModelOption(id: slug, name: name, efforts: efforts ?? ["low", "medium", "high", "xhigh"],
-                                   defaultEffort: m?["default_reasoning_level"] as? String ?? "medium")
-            }
-        case .gemini:
             return [
+                ModelOption(id: "gpt-6.2-sol", name: "GPT-6.2-Sol", blurb: "Best edits", efforts: ["low", "medium", "high", "xhigh"], defaultEffort: "medium"),
+                ModelOption(id: "gpt-6.2-astra", name: "GPT-6.2-Astra", blurb: "Fast", efforts: ["low", "medium", "high", "xhigh"], defaultEffort: "medium"),
+                ModelOption(id: "gpt-6.1-terra", name: "GPT-6.1-Terra", blurb: "", efforts: ["low", "medium", "high", "xhigh"], defaultEffort: "medium"),
+                ModelOption(id: "gpt-6-luna", name: "GPT-6-Luna", blurb: "Fastest", efforts: ["low", "medium", "high"], defaultEffort: "low"),
+            ]
+        case .gemini:
+            if let live = discoveredModels[.gemini], !live.isEmpty { return live }
+            if AgentConnect.shared.agyCLI != nil {
+                return [
+                    ModelOption(id: "gemini-4-neon", name: "Gemini 4 Neon", blurb: "Best edits", efforts: ["low", "medium", "high", "xhigh"], defaultEffort: "high"),
+                    ModelOption(id: "gemini-4-carbon", name: "Gemini 4 Carbon", blurb: "Most capable", efforts: ["low", "medium", "high"], defaultEffort: "medium"),
+                    ModelOption(id: "gemini-4-argon", name: "Gemini 4 Argon", blurb: "Balanced", efforts: ["low", "medium", "high"], defaultEffort: "medium"),
+                    ModelOption(id: "gemini-4-hydrogen", name: "Gemini 4 Hydrogen", blurb: "Fastest", efforts: ["low", "medium", "high", "xhigh"], defaultEffort: "low"),
+                    ModelOption(id: "gemini-3.8-flash", name: "Gemini 3.8 Flash", blurb: "Fast", efforts: ["low", "medium", "high"], defaultEffort: "medium"),
+                ]
+            }
+            return [
+                ModelOption(id: "auto", name: "Auto", blurb: "Recommended", efforts: [], defaultEffort: ""),
+                ModelOption(id: "gemini-3.5-flash", name: "Gemini 3.5 Flash", blurb: "Fast", efforts: [], defaultEffort: ""),
+                ModelOption(id: "gemini-3.1-flash-lite", name: "Gemini 3.1 Flash-Lite", blurb: "Fastest", efforts: [], defaultEffort: ""),
                 ModelOption(id: "gemini-2.5-pro", name: "Gemini 2.5 Pro", blurb: "Best edits", efforts: [], defaultEffort: ""),
-                ModelOption(id: "gemini-2.5-flash", name: "Gemini 2.5 Flash", blurb: "Fast", efforts: [], defaultEffort: ""),
-                ModelOption(id: "gemini-2.5-flash-lite", name: "Flash-Lite", blurb: "Fastest", efforts: [], defaultEffort: ""),
             ]
         case .grok:
+            if let live = discoveredModels[.grok], !live.isEmpty { return live }
             return [
                 ModelOption(id: "grok-4.7", name: "Grok 4.7", blurb: "Best edits", efforts: ["low", "medium", "high"], defaultEffort: "low"),
-                ModelOption(id: "grok-code-fast", name: "Grok Fast", blurb: "Fastest", efforts: ["low", "medium"], defaultEffort: "low"),
+                ModelOption(id: "grok-4.7-build-fast", name: "Grok 4.7 Build Fast", blurb: "Fastest", efforts: ["low", "medium"], defaultEffort: "low"),
+                ModelOption(id: "grok-4.6", name: "Grok 4.6", blurb: "Balanced", efforts: ["low", "medium", "high"], defaultEffort: "medium"),
+                ModelOption(id: "grok-4.5", name: "Grok 4.5", blurb: "", efforts: ["low", "medium"], defaultEffort: "low"),
             ]
         }
     }
@@ -401,7 +553,7 @@ final class MagicAgent: ObservableObject {
         let cli: URL? = switch kind {
         case .claude: AgentConnect.shared.claudeCLI
         case .chatgpt: AgentConnect.shared.codexCLI
-        case .gemini: AgentConnect.shared.geminiCLI
+        case .gemini: AgentConnect.shared.preferredGeminiCLI
         case .grok: AgentConnect.shared.grokCLI
         }
         guard let cli else { return }
@@ -596,15 +748,26 @@ final class MagicAgent: ObservableObject {
             if !effort(for: kind).isEmpty { p.arguments! += ["-c", "model_reasoning_effort=\"\(effort(for: kind))\""] }
             p.arguments! += ["-"]
         case .gemini:
-            // Project-local .gemini/settings.json binds the draft MCP URL cleanly for this run.
-            let gdir = folder.appendingPathComponent(".gemini", isDirectory: true)
-            try? fm.createDirectory(at: gdir, withIntermediateDirectories: true)
-            let cfg: [String: Any] = ["mcpServers": ["editroom": ["httpUrl": url, "trust": true, "timeout": 300_000]]]
-            if let data = try? JSONSerialization.data(withJSONObject: cfg, options: [.prettyPrinted]) {
-                try? data.write(to: gdir.appendingPathComponent("settings.json"), options: .atomic)
+            if cli.lastPathComponent == "agy" {
+                // Antigravity CLI (`agy`) runs Gemini 4 (Carbon, Neon, Argon, Hydrogen) natively.
+                let baseModel = model(for: kind)
+                let eff = effort(for: kind)
+                let fullModel = (!baseModel.isEmpty && !eff.isEmpty && !baseModel.hasSuffix("-\(eff)")) ? "\(baseModel)-\(eff)" : baseModel
+                p.arguments = ["-p", brief, "--output-format", "stream-json", "--dangerously-skip-permissions", "--disable-slash-commands"]
+                if !fullModel.isEmpty { p.arguments! += ["--model", fullModel] }
+                if !eff.isEmpty { p.arguments! += ["--effort", eff] }
+            } else {
+                // Legacy Gemini CLI: project-local .gemini/settings.json binds the draft MCP URL.
+                let gdir = folder.appendingPathComponent(".gemini", isDirectory: true)
+                try? fm.createDirectory(at: gdir, withIntermediateDirectories: true)
+                let cfg: [String: Any] = ["mcpServers": ["editroom": ["httpUrl": url, "trust": true, "timeout": 300_000]]]
+                if let data = try? JSONSerialization.data(withJSONObject: cfg, options: [.prettyPrinted]) {
+                    try? data.write(to: gdir.appendingPathComponent("settings.json"), options: .atomic)
+                }
+                p.arguments = ["-p", brief, "-o", "stream-json", "--yolo", "--skip-trust", "--allowed-mcp-server-names", "editroom"]
+                let chosen = model(for: kind)
+                if !chosen.isEmpty, chosen != "auto" { p.arguments! += ["-m", chosen] }
             }
-            p.arguments = ["-p", brief, "-o", "stream-json", "--yolo", "--skip-trust", "--allowed-mcp-server-names", "editroom"]
-            if !model(for: kind).isEmpty { p.arguments! += ["-m", model(for: kind)] }
         case .grok:
             // Project-local .grok/config.toml routes Grok's MCP calls to this run's hidden draft.
             let gdir = folder.appendingPathComponent(".grok", isDirectory: true)
@@ -722,18 +885,31 @@ final class MagicAgent: ObservableObject {
     private func readGemini(_ json: [String: Any]) {
         let type = json["type"] as? String ?? ""
         switch type {
-        case "tool_use":
+        case "tool_use", "tool_call":
             if let name = json["tool_name"] as? String ?? json["name"] as? String {
                 toolCalled(name.replacingOccurrences(of: "mcp__editroom__", with: ""))
+            }
+        case "assistant":
+            if let text = json["text"] as? String ?? json["content"] as? String, !text.isEmpty {
+                lastMessage = text
+            } else if let content = (json["message"] as? [String: Any])?["content"] as? [[String: Any]] {
+                if let tool = content.last(where: { $0["type"] as? String == "tool_use" })?["name"] as? String {
+                    toolCalled(tool.replacingOccurrences(of: "mcp__editroom__", with: ""))
+                }
+                if let text = content.last(where: { $0["type"] as? String == "text" })?["text"] as? String, !text.isEmpty {
+                    lastMessage = text
+                }
             }
         case "message":
             if (json["role"] as? String) == "assistant", let content = json["content"] as? String, !content.isEmpty {
                 lastMessage = content
             }
         case "result":
-            if let text = json["response"] as? String ?? json["result"] as? String, !text.isEmpty { lastMessage = text }
-            if (json["status"] as? String) == "error" {
-                failure = ((json["error"] as? [String: Any])?["message"] as? String) ?? "Gemini stopped."
+            if let text = json["response"] as? String ?? json["result"] as? String ?? json["text"] as? String, !text.isEmpty {
+                lastMessage = text
+            }
+            if (json["status"] as? String) == "error" || (json["is_error"] as? Bool) == true {
+                failure = ((json["error"] as? [String: Any])?["message"] as? String) ?? (lastMessage.isEmpty ? "Gemini stopped." : lastMessage)
             }
         case "error":
             failure = json["message"] as? String ?? ((json["error"] as? [String: Any])?["message"] as? String) ?? failure

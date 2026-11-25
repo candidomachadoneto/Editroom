@@ -162,25 +162,49 @@ struct PreviewView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            GeometryReader { geo in
-                let aspect = model.project.aspect
-                let fit = min(geo.size.width, geo.size.height * aspect)
-                // 100% is one frame pixel per screen pixel.
-                let scale = NSScreen.main?.backingScaleFactor ?? 2
-                let w = zoom.map { CGFloat(Double(model.project.width) * $0) / scale } ?? fit
-                let h = w / aspect
-                let viewer = picture(w: w, h: h).background(MagicAnchor(key: "viewer"))
-                if w <= geo.size.width + 0.5 && h <= geo.size.height + 0.5 {
-                    viewer.position(x: geo.size.width / 2, y: geo.size.height / 2)
-                } else {
-                    ScrollView([.horizontal, .vertical]) {
-                        viewer.frame(minWidth: geo.size.width, minHeight: geo.size.height)
+            ZStack {
+                // Clicking anywhere outside the video frame (margins/backdrop) clears the selection.
+                Color.clear
+                    .contentShape(Rectangle())
+                    .onTapGesture {
+                        if !model.selection.isEmpty { model.selection = [] }
                     }
-                    .scrollIndicators(.visible)
+
+                GeometryReader { geo in
+                    let aspect = model.project.aspect
+                    let fit = min(geo.size.width, geo.size.height * aspect)
+                    // 100% is one frame pixel per screen pixel.
+                    let scale = NSScreen.main?.backingScaleFactor ?? 2
+                    let w = zoom.map { CGFloat(Double(model.project.width) * $0) / scale } ?? fit
+                    let h = w / aspect
+                    let viewer = picture(w: w, h: h).background(MagicAnchor(key: "viewer"))
+                    if w <= geo.size.width + 0.5 && h <= geo.size.height + 0.5 {
+                        ZStack {
+                            Color.clear
+                                .contentShape(Rectangle())
+                                .onTapGesture {
+                                    if !model.selection.isEmpty { model.selection = [] }
+                                }
+                            viewer.position(x: geo.size.width / 2, y: geo.size.height / 2)
+                        }
+                    } else {
+                        ScrollView([.horizontal, .vertical]) {
+                            ZStack {
+                                Color.clear
+                                    .contentShape(Rectangle())
+                                    .onTapGesture {
+                                        if !model.selection.isEmpty { model.selection = [] }
+                                    }
+                                viewer
+                            }
+                            .frame(minWidth: geo.size.width, minHeight: geo.size.height)
+                        }
+                        .scrollIndicators(.visible)
+                    }
                 }
+                .padding(.horizontal, 16)
+                .padding(.top, 16)
             }
-            .padding(.horizontal, 16)
-            .padding(.top, 16)
 
             // CapCut-style quick canvas bar when a visual transformable clip is selected.
             if let clip = activeTarget, clip.isTransformable, !model.viewerOnly {

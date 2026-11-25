@@ -120,7 +120,7 @@ final class AgentConnect: ObservableObject {
             return installed ? .ready : .missing
         case .gemini:
             if geminiConnected { return .connected }
-            let installed = geminiCLI != nil || FileManager.default.fileExists(atPath: geminiHome.path)
+            let installed = preferredGeminiCLI != nil || FileManager.default.fileExists(atPath: geminiHome.path)
             return installed ? .ready : .missing
         case .grokBot:
             if grokConnected { return .connected }
@@ -460,10 +460,19 @@ final class AgentConnect: ObservableObject {
         "\"" + s.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"") + "\""
     }
 
-    // MARK: Gemini CLI (~/.gemini/settings.json)
+    // MARK: Gemini (Antigravity CLI `agy` + Gemini CLI `~/.gemini/settings.json`)
 
     var geminiHome: URL { home.appendingPathComponent(".gemini", isDirectory: true) }
     private var geminiSettings: URL { geminiHome.appendingPathComponent("settings.json") }
+    private var antigravityMCPConfig: URL { geminiHome.appendingPathComponent("antigravity/mcp_config.json") }
+
+    /// Antigravity CLI (`agy`) for Gemini 4 (Carbon, Neon, Argon, Hydrogen) & latest Google models.
+    var agyCLI: URL? {
+        let fm = FileManager.default
+        let h = home.path
+        let known = ["\(h)/.local/bin/agy", "/opt/homebrew/bin/agy", "/usr/local/bin/agy"]
+        return known.first(where: { fm.isExecutableFile(atPath: $0) }).map { URL(fileURLWithPath: $0) }
+    }
 
     var geminiCLI: URL? {
         let fm = FileManager.default
@@ -472,10 +481,18 @@ final class AgentConnect: ObservableObject {
         return known.first(where: { fm.isExecutableFile(atPath: $0) }).map { URL(fileURLWithPath: $0) }
     }
 
+    /// Preferred executable for Gemini Magic runs: `agy` (Gemini 4 family) first, falling back to `gemini`.
+    var preferredGeminiCLI: URL? { agyCLI ?? geminiCLI }
+
     var geminiConnected: Bool {
-        guard let data = try? Data(contentsOf: geminiSettings),
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return false }
-        return (json["mcpServers"] as? [String: Any])?["editroom"] != nil
+        for file in [antigravityMCPConfig, geminiSettings] {
+            if let data = try? Data(contentsOf: file),
+               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               (json["mcpServers"] as? [String: Any])?["editroom"] != nil {
+                return true
+            }
+        }
+        return false
     }
 
     func connectGemini() throws {

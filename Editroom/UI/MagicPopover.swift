@@ -32,7 +32,10 @@ struct MagicPopover: View {
         .padding(14)
         .frame(width: 444)
         .background(Theme.panel)
-        .onAppear { connections.refresh() }
+        .onAppear {
+            connections.refresh()
+            ai.refreshModels()
+        }
         .onChange(of: ai.available) { _, now in
             if let k = connecting, now.contains(k) {
                 justConnected = k

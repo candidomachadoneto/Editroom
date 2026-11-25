@@ -677,8 +677,8 @@ private struct AppRow: View {
         case (.claude, .connected): "Connected. Claude can edit here, and Magic can use it."
         case (.chatgpt, .ready): "Adds Editroom to Codex in the ChatGPT app."
         case (.chatgpt, .connected): "Connected. ChatGPT can edit here, and Magic can use it."
-        case (.gemini, .ready): "Adds Editroom to Gemini CLI (~/.gemini/settings.json)."
-        case (.gemini, .connected): "Connected. Gemini can edit here, and Magic can use it."
+        case (.gemini, .ready): "Adds Editroom to Gemini 4 (Antigravity / Gemini CLI)."
+        case (.gemini, .connected): "Connected. Gemini 4 & Gemini CLI can edit here, and Magic can use it."
         case (.grokBot, .ready): "Adds Editroom to Grok Bot & Voice Director (~/.grok/config.toml)."
         case (.grokBot, .connected):
             connect.grokSwarmOnline
