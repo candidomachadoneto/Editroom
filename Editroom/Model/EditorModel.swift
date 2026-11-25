@@ -2455,6 +2455,27 @@ final class EditorModel: ObservableObject {
                 }
             }
         }
+        // Guarantee every visual swarm mission always feels like a true multi-squad nano-bot swarm
+        // (never just 1 lonely cursor!), adding synchronized companion squads across Preview & Timeline.
+        let representedSquads = Set(waves.map(\.squad))
+        if representedSquads.count < 4 {
+            let companionDefs: [(SwarmSquad, String, CGFloat, CGFloat, Bool)] = [
+                (.framer, "Frame Sync", 0.50, 0.65, true),
+                (.cards, "Layer Check", 0.50, 0.28, true),
+                (.cutter, "Timeline Lock", 0.36, 0.50, false),
+                (.colorist, "Color Sync", 0.70, 0.50, true),
+                (.motion, "FX Sync", 0.50, 0.14, true),
+                (.audio, "Audio Sync", 0.55, 0.78, false),
+            ]
+            var added = 0
+            for (sq, act, fx, fy, inPreview) in companionDefs where !representedSquads.contains(sq) && added < (4 - representedSquads.count) {
+                let baseRect = toOverlay(inPreview ? (viewerWinRect ?? tlWinRect) : tlWinRect)
+                let pt = CGPoint(x: baseRect.minX + baseRect.width * fx, y: baseRect.minY + baseRect.height * fy)
+                jobs.append(SwarmJob(botID: "swarm-\(sq.rawValue)-sync", squad: sq, action: act,
+                                     target: pt, highlightRect: nil, delay: 0.04 + Double(added) * 0.045))
+                added += 1
+            }
+        }
         AgentPresence.shared.dispatchWave(mission: mission, jobs: jobs, in: window)
     }
 

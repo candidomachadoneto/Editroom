@@ -635,9 +635,18 @@ enum MCPTools {
                     default: return nil
                     }
                 } ?? ""
-                let squad = SwarmSquad.infer(agent: who, label: actionLabel)
-                AgentPresence.shared.glide(who, name: who, color: Self.color(for: who, squad: squad), squad: squad,
-                                           action: actionLabel, to: targetInfo.point, highlightRect: targetInfo.rect, in: window)
+                let editedIDs = Set(edits.flatMap(\.clipIDs))
+                AgentPresence.shared.dispatchMCPSwarmStrike(
+                    who: who,
+                    action: actionLabel,
+                    primaryPoint: targetInfo.point,
+                    primaryRect: targetInfo.rect,
+                    editedClipIDs: editedIDs,
+                    project: model.project,
+                    playhead: model.playhead,
+                    canvas: canvas,
+                    in: window
+                )
             }
             return
         }

@@ -158,9 +158,9 @@ final class AgentPresence: ObservableObject {
 
     private init() {
         meshLayer.fillColor = nil
-        meshLayer.strokeColor = NSColor(srgbRed: 0.22, green: 0.74, blue: 0.97, alpha: 0.22).cgColor
-        meshLayer.lineWidth = 1.1
-        meshLayer.lineDashPattern = [4, 4]
+        meshLayer.strokeColor = NSColor(srgbRed: 0.22, green: 0.74, blue: 0.97, alpha: 0.36).cgColor
+        meshLayer.lineWidth = 1.35
+        meshLayer.lineDashPattern = [5, 4]
         root.addSublayer(meshLayer)
     }
 
@@ -256,6 +256,130 @@ final class AgentPresence: ObservableObject {
             try? await Task.sleep(nanoseconds: 2_300_000_000)
             if !Task.isCancelled { self?.missionTitle = nil }
         }
+    }
+
+    /// Launches a full synchronized nano-bot swarm across BOTH the Preview Canvas and the Timeline
+    /// whenever an MCP/Voice agent executes any edit — ensuring multiple color-coded squads are
+    /// always visibly working together in sync (never a single lonely cursor!).
+    func dispatchMCPSwarmStrike(who: String, action: String, primaryPoint: CGPoint, primaryRect: CGRect?,
+                                editedClipIDs: Set<UUID>, project: Project, playhead: Double,
+                                canvas: TimelineCanvas, in host: NSWindow) {
+        guard Self.enabled else { return }
+        let primarySquad = SwarmSquad.infer(agent: who, label: action)
+        let primaryColor = primarySquad.nsColor
+        let viewerWinRect = MagicAnchors.rect("viewer")
+        let tlWinRect = canvas.convert(canvas.bounds, to: nil)
+        func toOverlay(_ r: NSRect) -> CGRect {
+            CGRect(x: r.minX, y: host.frame.height - r.maxY, width: r.width, height: r.height)
+        }
+        let ovTimeline = toOverlay(tlWinRect)
+        let ovViewer = viewerWinRect.map(toOverlay)
+
+        // 1. Primary agent strikes its exact edited clip on the Timeline immediately.
+        glide(who, name: who, color: primaryColor, squad: primarySquad,
+              action: action, to: primaryPoint, highlightRect: primaryRect,
+              in: host, pulse: true, spawnOffsetY: -34, linger: 3.6)
+
+        missionTitle = action.isEmpty ? "Swarm · \(who)" : "Swarm · \(action)"
+        AppleHaptics.tick(minInterval: 0.05)
+
+        // 2. Build a coordinated multi-squad swarm wave covering Preview Canvas + Timeline tracks!
+        var jobs: [SwarmJob] = []
+        let editedClips = project.clips.filter { editedClipIDs.contains($0.id) }
+        let activeVideoClips = project.clips.filter {
+            $0.kind != .audio && playhead >= $0.start - 0.1 && playhead <= $0.end + 0.1
+        }
+        let v1Clip = editedClips.first(where: { $0.kind == .video }) ?? activeVideoClips.first ?? project.clips.first(where: { $0.kind == .video })
+        let v1TrackID = project.videoTracks.first?.id
+        let v2Clip = project.clips.first(where: { c in
+            (c.kind == .video || c.kind == .image) && c.trackID != v1TrackID
+        })
+        let a1Clip = project.clips.first(where: { $0.kind == .audio })
+        let titleClip = project.clips.first(where: { $0.kind == .text })
+
+        func previewPoint(for clip: Clip?, fallbackX: CGFloat, fallbackY: CGFloat) -> (CGPoint, CGRect?) {
+            guard let ov = ovViewer, ov.width > 40, ov.height > 40 else {
+                return (CGPoint(x: ovTimeline.minX + ovTimeline.width * fallbackX,
+                                y: ovTimeline.minY + ovTimeline.height * fallbackY), nil)
+            }
+            if let clip, clip.kind != .audio {
+                let tf = clip.transform ?? ClipTransform()
+                let px = clip.kind == .text
+                    ? ov.minX + CGFloat(clip.text.x) * ov.width
+                    : ov.midX + CGFloat(max(-0.42, min(0.42, tf.x))) * ov.width
+                let py = clip.kind == .text
+                    ? ov.minY + CGFloat(clip.text.y) * ov.height
+                    : ov.midY + CGFloat(max(-0.42, min(0.42, tf.y))) * ov.height
+                let boxW = max(62, ov.width * 0.30 * CGFloat(min(1.4, max(0.35, tf.scale))))
+                let boxH = max(42, ov.height * 0.24 * CGFloat(min(1.4, max(0.35, tf.scale))))
+                let box = CGRect(x: px - boxW / 2, y: py - boxH / 2, width: boxW, height: boxH).intersection(ov)
+                return (CGPoint(x: px, y: py), box.isEmpty ? nil : box)
+            }
+            let px = ov.minX + ov.width * fallbackX
+            let py = ov.minY + ov.height * fallbackY
+            let box = CGRect(x: px - 42, y: py - 28, width: 84, height: 56).intersection(ov)
+            return (CGPoint(x: px, y: py), box.isEmpty ? nil : box)
+        }
+
+        func timelinePoint(for clip: Clip?, xFrac: CGFloat, yFrac: CGFloat) -> (CGPoint, CGRect?) {
+            if let clip, let r = canvas.magicWindowRect(of: clip, in: project) {
+                let ov = toOverlay(r)
+                let clampedX = min(ovTimeline.maxX - 24, max(ovTimeline.minX + 24, ov.minX + ov.width * xFrac))
+                return (CGPoint(x: clampedX, y: ov.midY), ov)
+            }
+            return (CGPoint(x: ovTimeline.minX + ovTimeline.width * xFrac,
+                            y: ovTimeline.minY + ovTimeline.height * yFrac), nil)
+        }
+
+        // Squad 1: Framer (Cyan) locks onto Preview presenter / V1 frame + micro-hop
+        let (fPt1, fBox1) = previewPoint(for: v1Clip, fallbackX: 0.50, fallbackY: 0.68)
+        let (fPt2, _) = previewPoint(for: v1Clip, fallbackX: 0.56, fallbackY: 0.72)
+        jobs.append(SwarmJob(botID: "nano-framer-pv", squad: .framer, action: primarySquad == .framer ? action : "Frame Sync",
+                             target: fPt1, highlightRect: fBox1, delay: 0.02))
+        jobs.append(SwarmJob(botID: "nano-framer-pv", squad: .framer, action: "Align Lock",
+                             target: fPt2, highlightRect: fBox1, delay: 0.34))
+
+        // Squad 2: Cards (Gold) locks onto V2 print/card on Preview + Timeline
+        let (cPt1, cBox1) = previewPoint(for: v2Clip, fallbackX: 0.50, fallbackY: 0.27)
+        let (cPt2, cBox2) = timelinePoint(for: v2Clip ?? v1Clip, xFrac: 0.38, yFrac: 0.34)
+        jobs.append(SwarmJob(botID: "nano-cards-pv", squad: .cards, action: primarySquad == .cards ? action : "Card Layer",
+                             target: cPt1, highlightRect: cBox1, delay: 0.05))
+        jobs.append(SwarmJob(botID: "nano-cards-tl", squad: .cards, action: "Overlay Sync",
+                             target: cPt2, highlightRect: cBox2, delay: 0.14))
+
+        // Squad 3: Cutter (Orange) scans Timeline cut points & edges
+        let (kPt1, kBox1) = timelinePoint(for: v1Clip, xFrac: 0.26, yFrac: 0.52)
+        let (kPt2, kBox2) = timelinePoint(for: v1Clip, xFrac: 0.64, yFrac: 0.52)
+        jobs.append(SwarmJob(botID: "nano-cutter-tl", squad: .cutter, action: primarySquad == .cutter ? action : "Timeline Scan",
+                             target: kPt1, highlightRect: kBox1, delay: 0.07))
+        jobs.append(SwarmJob(botID: "nano-cutter-tl", squad: .cutter, action: "Edge Lock",
+                             target: kPt2, highlightRect: kBox2, delay: 0.38))
+
+        // Squad 4: Colorist (Emerald) balances Preview color/exposure
+        let (colPt1, colBox1) = previewPoint(for: nil, fallbackX: 0.28, fallbackY: 0.52)
+        let (colPt2, _) = previewPoint(for: nil, fallbackX: 0.72, fallbackY: 0.48)
+        jobs.append(SwarmJob(botID: "nano-color-pv", squad: .colorist, action: primarySquad == .colorist ? action : "Color Pass",
+                             target: colPt1, highlightRect: colBox1, delay: 0.10))
+        jobs.append(SwarmJob(botID: "nano-color-pv", squad: .colorist, action: "Grade Sync",
+                             target: colPt2, highlightRect: nil, delay: 0.42))
+
+        // Squad 5: Motion (Coral) tracks titles/FX/animation across top frame
+        let (mPt1, mBox1) = previewPoint(for: titleClip, fallbackX: 0.52, fallbackY: 0.12)
+        let (mPt2, _) = previewPoint(for: titleClip, fallbackX: 0.50, fallbackY: 0.84)
+        jobs.append(SwarmJob(botID: "nano-motion-pv", squad: .motion, action: primarySquad == .motion ? action : "Motion Sync",
+                             target: mPt1, highlightRect: mBox1, delay: 0.12))
+        jobs.append(SwarmJob(botID: "nano-motion-pv", squad: .motion, action: "FX Ready",
+                             target: mPt2, highlightRect: nil, delay: 0.46))
+
+        // Squad 6: Audio (Green) locks onto A1 waveform & syncs mix
+        let (aPt1, aBox1) = timelinePoint(for: a1Clip, xFrac: 0.35, yFrac: 0.78)
+        let (aPt2, aBox2) = timelinePoint(for: a1Clip, xFrac: 0.68, yFrac: 0.78)
+        jobs.append(SwarmJob(botID: "nano-audio-tl", squad: .audio, action: primarySquad == .audio ? action : "Audio Sync",
+                             target: aPt1, highlightRect: aBox1, delay: 0.09))
+        jobs.append(SwarmJob(botID: "nano-audio-tl", squad: .audio, action: "Mix Lock",
+                             target: aPt2, highlightRect: aBox2, delay: 0.40))
+
+        dispatchWave(mission: missionTitle ?? "Swarm Active", jobs: jobs, in: host)
     }
 
     /// Takes an agent's cursor back for its next edit; returns where it was, if it's still around.
@@ -481,23 +605,24 @@ final class AgentPresence: ObservableObject {
                 p.targetBox.opacity = 0
             }
 
-            if age < 2.4 { activePoints.append(pos) }
+            if age < 3.4 { activePoints.append(pos) }
         }
 
-        // Draw subtle synchronization mesh lines between concurrently working nano-bots!
+        // Draw crisp synchronization mesh lines connecting ALL concurrently working nano-bots
+        // across both the Preview Canvas and the Timeline!
         if activePoints.count >= 2 {
             let mesh = CGMutablePath()
             for i in 0..<activePoints.count {
                 for j in (i + 1)..<activePoints.count {
                     let a = activePoints[i], b = activePoints[j]
-                    if hypot(a.x - b.x, a.y - b.y) < 720 {
+                    if hypot(a.x - b.x, a.y - b.y) < 1500 {
                         mesh.move(to: a)
                         mesh.addLine(to: b)
                     }
                 }
             }
             meshLayer.path = mesh
-            meshLayer.lineDashPhase = CGFloat(-now * 28)
+            meshLayer.lineDashPhase = CGFloat(-now * 38)
             meshLayer.opacity = 1
         } else {
             meshLayer.path = nil
