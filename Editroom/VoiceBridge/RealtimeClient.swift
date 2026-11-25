@@ -64,11 +64,12 @@ final class RealtimeClient: NSObject, URLSessionWebSocketDelegate, @unchecked Se
         case sessionReady
         case speechStarted
         case speechStopped
+        case responseStarted
         case audioDelta(Data)
         case transcriptDelta(String)
         case responseDone
         case functionCall(name: String, callID: String, arguments: String)
-        case serverError(String)
+        case serverError(code: String, message: String)
         case disconnected(Error?)
     }
 
@@ -289,14 +290,18 @@ final class RealtimeClient: NSObject, URLSessionWebSocketDelegate, @unchecked Se
         }
     }
 
-    /// Hot-updates session instructions mid-connection (e.g. after timeline state refresh or new learned taste).
-    func updateSession(model: VoiceEngineModel, instructions: String, vadMode: VoiceVADMode) {
-        let json = Self.buildSessionUpdateJSON(model: model, instructions: instructions, vadMode: vadMode)
+    /// Hot-updates ONLY the session instructions mid-connection (safe even after assistant audio has played,
+    /// since OpenAI Realtime forbids re-sending `voice` once assistant audio exists in the conversation).
+    func updateInstructions(_ instructions: String) {
         queue.async { [weak self] in
-            guard let self else { return }
-            self.sessionConfigJSON = json
-            if self.isOpen, let ws = self.task, !self.isClosing {
-                ws.send(.string(json)) { _ in }
+            guard let self, self.isOpen, let ws = self.task, !self.isClosing else { return }
+            let sessionBody: [String: Any] = self.currentModel.provider == .openai
+                ? ["type": "realtime", "instructions": instructions]
+                : ["instructions": instructions]
+            let event: [String: Any] = ["type": "session.update", "session": sessionBody]
+            if let d = try? JSONSerialization.data(withJSONObject: event),
+               let s = String(data: d, encoding: .utf8) {
+                ws.send(.string(s)) { _ in }
             }
         }
     }
@@ -411,6 +416,8 @@ final class RealtimeClient: NSObject, URLSessionWebSocketDelegate, @unchecked Se
             onEvent?(.speechStarted)
         case "input_audio_buffer.speech_stopped":
             onEvent?(.speechStopped)
+        case "response.created":
+            onEvent?(.responseStarted)
         case "response.output_audio.delta", "response.audio.delta":
             if let b64 = json["delta"] as? String, let pcm = Data(base64Encoded: b64), !pcm.isEmpty {
                 onEvent?(.audioDelta(pcm))
@@ -430,8 +437,9 @@ final class RealtimeClient: NSObject, URLSessionWebSocketDelegate, @unchecked Se
             }
         case "error":
             let errObj = json["error"] as? [String: Any]
+            let code = (errObj?["code"] as? String) ?? ""
             let msg = (errObj?["message"] as? String) ?? (json["message"] as? String) ?? "Erro na sessão de voz."
-            onEvent?(.serverError(msg))
+            onEvent?(.serverError(code: code, message: msg))
         default:
             break
         }

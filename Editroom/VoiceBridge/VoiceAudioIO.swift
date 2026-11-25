@@ -13,6 +13,7 @@ final class VoiceAudioIO: @unchecked Sendable {
     private let lock = NSLock()
     private var captureActive = false
     private var engineRunning = false
+    private var voiceProcessingConfigured = false
     private var converter: AVAudioConverter?
     private var pendingBuffers = 0
     private var playbackFormat: AVAudioFormat?
@@ -70,6 +71,11 @@ final class VoiceAudioIO: @unchecked Sendable {
         guard !captureActive else { return }
 
         let inputNode = engine.inputNode
+        if !voiceProcessingConfigured {
+            // Enable macOS hardware Acoustic Echo Cancellation (AEC) once before starting the graph.
+            try? inputNode.setVoiceProcessingEnabled(true)
+            voiceProcessingConfigured = true
+        }
         let hwFormat = inputNode.outputFormat(forBus: 0)
         guard hwFormat.sampleRate > 0, hwFormat.channelCount > 0 else {
             throw NSError(domain: "VoiceAudioIO", code: -1, userInfo: [

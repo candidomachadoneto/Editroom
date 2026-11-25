@@ -43,7 +43,7 @@ final class VoiceBridge: ObservableObject {
     @Published var vadMode: VoiceVADMode {
         didSet {
             UserDefaults.standard.set(vadMode.rawValue, forKey: "voiceBridge.vadMode")
-            if activeSession { pushUpdatedInstructions() }
+            if activeSession { reconnectWithCurrentSettings() }
         }
     }
 
@@ -63,6 +63,7 @@ final class VoiceBridge: ObservableObject {
     private let taste = EditingTasteDB.shared
 
     private var activeSession = false
+    private var responseInProgress = false
     private var reconnectedOnce = false
     private var prewarmed = false
     private var healthTimer: Timer?
@@ -120,6 +121,7 @@ final class VoiceBridge: ObservableObject {
         sessionGeneration += 1
         let gen = sessionGeneration
         activeSession = true
+        responseInProgress = false
         reconnectedOnce = false
         liveSubtitle = ""
         activeTeamStatus = nil
@@ -171,12 +173,11 @@ final class VoiceBridge: ObservableObject {
     func stop() {
         sessionGeneration += 1
         activeSession = false
+        responseInProgress = false
         reconnectedOnce = false
         activeTeamStatus = nil
         coordinator.cancelAll()
         audio.stopAll()
-        realtime.cancelResponse()
-        realtime.clearInputAudioBuffer()
         realtime.disconnect()
         liveSubtitle = ""
         state = .idle
@@ -252,7 +253,7 @@ final class VoiceBridge: ObservableObject {
     }
 
     private func pushUpdatedInstructions() {
-        realtime.updateSession(model: voiceModel, instructions: buildDynamicInstructions(), vadMode: vadMode)
+        realtime.updateInstructions(buildDynamicInstructions())
     }
 
     private func reconnectWithCurrentSettings() {
@@ -319,18 +320,28 @@ final class VoiceBridge: ObservableObject {
             if activeSession, case .error = state { state = .listening }
 
         case .speechStarted:
-            // Instant barge-in: stop audio, clear queue, cancel active model turn & late specialist tasks.
+            // Instant barge-in: stop local playback immediately; only send response.cancel if a response is actually active!
             guard activeSession else { return }
             audio.interruptPlayback()
-            realtime.cancelResponse()
+            if responseInProgress {
+                realtime.cancelResponse()
+                responseInProgress = false
+            }
             liveSubtitle = ""
             state = .listening
 
-        case .speechStopped, .responseDone:
+        case .speechStopped:
             break
+
+        case .responseStarted:
+            responseInProgress = true
+
+        case .responseDone:
+            responseInProgress = false
 
         case .audioDelta(let pcmData):
             guard activeSession else { return }
+            responseInProgress = true
             audio.enqueuePCM16(pcmData)
 
         case .transcriptDelta(let delta):
@@ -344,8 +355,17 @@ final class VoiceBridge: ObservableObject {
             let gen = sessionGeneration
             Task { await self.executeTool(name: name, callID: callID, argumentsJSON: arguments, generation: gen) }
 
-        case .serverError(let msg):
+        case .serverError(let code, let msg):
             guard activeSession else { return }
+            // Ignore benign Realtime state races (e.g. cancelling a response that already finished).
+            let benignCodes: Set<String> = [
+                "response_cancel_not_active",
+                "conversation_already_has_active_response",
+                "input_audio_buffer_commit_empty",
+            ]
+            if benignCodes.contains(code) || msg.localizedCaseInsensitiveContains("no active response") {
+                return
+            }
             handleConnectionFailure(msg)
 
         case .disconnected(let err):
@@ -355,6 +375,7 @@ final class VoiceBridge: ObservableObject {
     }
 
     private func handleConnectionFailure(_ reason: String) {
+        NSLog("[VoiceBridge] connection issue: %@", reason)
         audio.interruptPlayback()
         state = .error(reason)
         if !reconnectedOnce, let apiKey = VoiceKeychain.loadAPIKey(for: voiceModel.provider) {
