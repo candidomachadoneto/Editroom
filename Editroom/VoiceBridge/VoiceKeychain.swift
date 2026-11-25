@@ -1,17 +1,34 @@
 import Foundation
 import Security
 
-/// Reads and optionally stores `XAI_API_KEY` from the process environment or macOS Keychain.
-/// Never logs or persists the key inside source files, logs, or project files.
+/// Reads and stores API keys (`OPENAI_API_KEY`, `XAI_API_KEY`) from environment or macOS Keychain.
+/// Never logs or persists any secret in source code, logs, or project files.
 enum VoiceKeychain {
-    private static let serviceNames = ["XAI_API_KEY", "xai_api_key", "com.editroom.xai-api-key"]
+    enum Provider: String, CaseIterable {
+        case openai
+        case xai
 
-    static func loadAPIKey() -> String? {
-        if let env = ProcessInfo.processInfo.environment["XAI_API_KEY"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+        var envName: String {
+            switch self {
+            case .openai: return "OPENAI_API_KEY"
+            case .xai: return "XAI_API_KEY"
+            }
+        }
+
+        var serviceNames: [String] {
+            switch self {
+            case .openai: return ["OPENAI_API_KEY", "openai_api_key", "com.editroom.openai-api-key"]
+            case .xai: return ["XAI_API_KEY", "xai_api_key", "com.editroom.xai-api-key"]
+            }
+        }
+    }
+
+    static func loadAPIKey(for provider: Provider) -> String? {
+        if let env = ProcessInfo.processInfo.environment[provider.envName]?.trimmingCharacters(in: .whitespacesAndNewlines),
            !env.isEmpty {
             return env
         }
-        for service in serviceNames {
+        for service in provider.serviceNames {
             if let key = readKeychain(service: service), !key.isEmpty {
                 return key
             }
@@ -20,10 +37,10 @@ enum VoiceKeychain {
     }
 
     @discardableResult
-    static func saveAPIKey(_ key: String) -> Bool {
+    static func saveAPIKey(_ key: String, for provider: Provider) -> Bool {
         let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, let data = trimmed.data(using: .utf8) else { return false }
-        let service = serviceNames[0]
+        let service = provider.serviceNames[0]
         let account = NSUserName()
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,

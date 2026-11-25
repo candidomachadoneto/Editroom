@@ -459,19 +459,21 @@ extension ToolbarContent {
 }
 
 
-/// Magic Voice button (Grok Voice 3.0 Realtime via VoiceBridge).
-/// Strictly decoupled: only calls `start()`, `stop()`, `toggle()`, and observes `VoiceBridge.state`.
+/// Magic Voice button (OpenAI GPT-2.1 Realtime + xAI Grok Voice + Multi-Model Team + Self-Improving Taste Memory).
+/// Strictly decoupled: only calls `VoiceBridge` methods and observes `VoiceBridge.state`.
 struct MagicVoiceButton: View {
     @ObservedObject private var bridge = VoiceBridge.shared
     @State private var hovering = false
     @State private var pulse = false
+    @State private var showDeck = false
 
     private var tooltip: String {
         switch bridge.state {
         case .idle:
-            return "Magic — Diretor de Voz (⌘⇧M). Clique para falar."
+            return "Magic (\(bridge.voiceModel.shortLabel)) — Clique ou ⌘⇧M para falar com o editor."
         case .listening:
-            return "Magic ouvindo… Clique ou pressione ⌘⇧M para parar."
+            if let team = bridge.activeTeamStatus { return "Equipe ativa: \(team)…" }
+            return "Magic ouvindo (\(bridge.voiceModel.shortLabel))… Clique ou ⌘⇧M para parar."
         case .speaking:
             return "Magic respondendo… Fale por cima para interromper ou clique para parar."
         case .error(let msg):
@@ -481,8 +483,7 @@ struct MagicVoiceButton: View {
 
     private var iconName: String {
         switch bridge.state {
-        case .idle: return "wand.and.stars"
-        case .listening: return "wand.and.stars"
+        case .idle, .listening: return "wand.and.stars"
         case .speaking: return "waveform"
         case .error: return "exclamationmark.triangle.fill"
         }
@@ -499,20 +500,16 @@ struct MagicVoiceButton: View {
 
     private var fillColor: Color {
         switch bridge.state {
-        case .idle:
-            return Theme.ink.opacity(hovering ? 0.14 : 0.08)
-        case .listening:
-            return Theme.accent.opacity(hovering ? 0.24 : 0.18)
-        case .speaking:
-            return Color(hex: 0x38BDF8).opacity(hovering ? 0.24 : 0.18)
-        case .error:
-            return Color(hex: 0xEF4444).opacity(hovering ? 0.22 : 0.15)
+        case .idle: return Theme.ink.opacity(hovering ? 0.14 : 0.08)
+        case .listening: return Theme.accent.opacity(hovering ? 0.24 : 0.18)
+        case .speaking: return Color(hex: 0x38BDF8).opacity(hovering ? 0.24 : 0.18)
+        case .error: return Color(hex: 0xEF4444).opacity(hovering ? 0.22 : 0.15)
         }
     }
 
     private var strokeColor: Color {
         switch bridge.state {
-        case .idle: return Theme.ink.opacity(0.05)
+        case .idle: return Theme.ink.opacity(0.06)
         case .listening: return Theme.accent.opacity(pulse ? 0.85 : 0.45)
         case .speaking: return Color(hex: 0x38BDF8).opacity(pulse ? 0.90 : 0.50)
         case .error: return Color(hex: 0xEF4444).opacity(0.60)
@@ -520,45 +517,60 @@ struct MagicVoiceButton: View {
     }
 
     var body: some View {
-        Button {
-            bridge.toggle()
-        } label: {
-            HStack(spacing: 5) {
-                ZStack {
-                    if bridge.state == .listening || bridge.state == .speaking {
-                        Circle()
-                            .fill(accentColor.opacity(pulse ? 0.28 : 0.08))
-                            .frame(width: 17, height: 17)
-                            .scaleEffect(pulse ? 1.18 : 0.85)
+        HStack(spacing: 0) {
+            Button {
+                bridge.toggle()
+            } label: {
+                HStack(spacing: 5) {
+                    ZStack {
+                        if bridge.state == .listening || bridge.state == .speaking {
+                            Circle()
+                                .fill(accentColor.opacity(pulse ? 0.28 : 0.08))
+                                .frame(width: 17, height: 17)
+                                .scaleEffect(pulse ? 1.18 : 0.85)
+                        }
+                        Image(systemName: iconName)
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundStyle(accentColor)
                     }
-                    Image(systemName: iconName)
-                        .font(.system(size: 11, weight: .semibold))
-                        .foregroundStyle(accentColor)
-                }
-                .frame(width: 14, height: 14)
+                    .frame(width: 14, height: 14)
 
-                Text("Magic")
-                    .font(.system(size: 11.5, weight: .semibold))
-                    .foregroundStyle(bridge.state == .idle ? Theme.text : accentColor)
+                    Text(bridge.activeTeamStatus != nil ? "Equipe…" : "Magic")
+                        .font(.system(size: 11.5, weight: .semibold))
+                        .foregroundStyle(bridge.state == .idle ? Theme.text : accentColor)
+                }
+                .padding(.leading, 10)
+                .padding(.trailing, 6)
+                .frame(height: 26)
+                .contentShape(Rectangle())
             }
-            .padding(.horizontal, 11)
-            .frame(height: 26)
-            .fixedSize()
-            .background(Capsule().fill(fillColor))
-            .overlay(Capsule().strokeBorder(strokeColor, lineWidth: bridge.state == .idle ? 1 : 1.3))
-            .contentShape(Capsule())
+            .buttonStyle(.plain)
+
+            Rectangle()
+                .fill(Theme.ink.opacity(0.12))
+                .frame(width: 1, height: 14)
+
+            Button {
+                bridge.refreshPreferences()
+                showDeck.toggle()
+            } label: {
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 8.5, weight: .bold))
+                    .foregroundStyle(bridge.state == .idle ? Theme.textDim : accentColor)
+                    .padding(.horizontal, 7)
+                    .frame(height: 26)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help("Escolher modelos (OpenAI, Claude, Gemini, Grok) e memória de gosto")
         }
-        .buttonStyle(.plain)
+        .fixedSize()
+        .background(Capsule().fill(fillColor))
+        .overlay(Capsule().strokeBorder(strokeColor, lineWidth: bridge.state == .idle ? 1 : 1.3))
         .onHover { hovering = $0 }
         .help(tooltip)
-        .contextMenu {
-            Button("Configurar XAI_API_KEY no Keychain…") {
-                promptForAPIKey()
-            }
-            if bridge.state.isActive {
-                Divider()
-                Button("Encerrar Sessão de Voz") { bridge.stop() }
-            }
+        .popover(isPresented: $showDeck, arrowEdge: .bottom) {
+            VoiceDirectorPopover(bridge: bridge)
         }
         .onAppear {
             bridge.prewarm()
@@ -575,19 +587,222 @@ struct MagicVoiceButton: View {
             }
         }
     }
+}
 
-    private func promptForAPIKey() {
+private struct VoiceDirectorPopover: View {
+    @ObservedObject var bridge: VoiceBridge
+    @State private var newRule = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Diretor de Voz · Magic")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(Theme.text)
+                    Text("Voz streaming + equipe multi-modelo + gosto aprendido")
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(Theme.textFaint)
+                }
+                Spacer()
+                Button(bridge.state.isActive ? "Parar" : "Falar") {
+                    bridge.toggle()
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                .tint(bridge.state.isActive ? Color(hex: 0xEF4444) : Color(hex: 0x38BDF8))
+            }
+
+            // 1. Streaming Voice Front-End picker
+            VStack(alignment: .leading, spacing: 6) {
+                Text("VOZ EM TEMPO REAL (VELOCIDADE)")
+                    .font(Theme.label()).kerning(1.1).foregroundStyle(Theme.textFaint)
+                Picker("", selection: $bridge.voiceModel) {
+                    ForEach(VoiceEngineModel.allCases) { m in
+                        Text(m.label).tag(m)
+                    }
+                }
+                .labelsHidden()
+                .pickerStyle(.menu)
+
+                if bridge.voiceModel.provider == .openai {
+                    HStack(spacing: 6) {
+                        Text("Detecção de fala:").font(.system(size: 10.5)).foregroundStyle(Theme.textDim)
+                        Picker("", selection: $bridge.vadMode) {
+                            ForEach(VoiceVADMode.allCases) { mode in
+                                Text(mode.label).tag(mode)
+                            }
+                        }
+                        .labelsHidden()
+                        .pickerStyle(.segmented)
+                        .controlSize(.small)
+                    }
+                }
+            }
+
+            Divider().opacity(0.25)
+
+            // 2. Multi-Model Team (combine any models!)
+            VStack(alignment: .leading, spacing: 6) {
+                HStack {
+                    Text("EQUIPE MULTI-MODELO (1 OU VÁRIOS JUNTOS)")
+                        .font(Theme.label()).kerning(1.1).foregroundStyle(Theme.textFaint)
+                    Spacer()
+                    Text("\(bridge.enabledSpecialists.count) ativo\(bridge.enabledSpecialists.count == 1 ? "" : "s")")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(Color(hex: 0x38BDF8))
+                }
+                LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 6) {
+                    ForEach(SpecialistModel.allCases) { m in
+                        let on = bridge.enabledSpecialists.contains(m)
+                        Button {
+                            bridge.toggleSpecialist(m)
+                        } label: {
+                            HStack(spacing: 6) {
+                                Image(systemName: on ? "checkmark.circle.fill" : "circle")
+                                    .font(.system(size: 11))
+                                    .foregroundStyle(on ? Color(hex: 0x38BDF8) : Theme.textFaint)
+                                VStack(alignment: .leading, spacing: 1) {
+                                    Text(m.label)
+                                        .font(.system(size: 11, weight: .semibold))
+                                        .foregroundStyle(Theme.text)
+                                    Text(m.roleSummary)
+                                        .font(.system(size: 9.5))
+                                        .foregroundStyle(Theme.textFaint)
+                                        .lineLimit(1)
+                                }
+                                Spacer(minLength: 0)
+                            }
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 6)
+                            .background(RoundedRectangle(cornerRadius: 7, style: .continuous)
+                                .fill(on ? Color(hex: 0x38BDF8).opacity(0.12) : Theme.field))
+                            .overlay(RoundedRectangle(cornerRadius: 7, style: .continuous)
+                                .strokeBorder(on ? Color(hex: 0x38BDF8).opacity(0.55) : .clear, lineWidth: 1))
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            }
+
+            Divider().opacity(0.25)
+
+            // 3. Learned Editing Taste Memory (SQLite + Supermemory)
+            VStack(alignment: .leading, spacing: 6) {
+                HStack {
+                    Text("GOSTO APRENDIDO (AUTO-APERFEIÇOAMENTO)")
+                        .font(Theme.label()).kerning(1.1).foregroundStyle(Theme.textFaint)
+                    Spacer()
+                    Text("\(bridge.preferences.count)")
+                        .font(Theme.mono(10, .semibold))
+                        .foregroundStyle(Theme.textFaint)
+                }
+
+                HStack(spacing: 6) {
+                    TextField("Ex.: cortes secos sem fade, título dourado no topo…", text: $newRule)
+                        .textFieldStyle(.plain)
+                        .font(.system(size: 11))
+                        .padding(.horizontal, 8)
+                        .frame(height: 24)
+                        .background(RoundedRectangle(cornerRadius: 6, style: .continuous).fill(Theme.field))
+                        .onSubmit(saveQuickRule)
+                    Button("Ensinar") { saveQuickRule() }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        .disabled(newRule.trimmingCharacters(in: .whitespaces).isEmpty)
+                }
+
+                if bridge.preferences.isEmpty {
+                    Text("Fale durante a edição (ex.: \"sempre faz assim\") para o editor aprender seu estilo.")
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(Theme.textFaint)
+                } else {
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 4) {
+                            ForEach(bridge.preferences.prefix(8)) { pref in
+                                HStack(spacing: 6) {
+                                    Text(pref.scope == .global ? "Sempre" : "Projeto")
+                                        .font(.system(size: 9, weight: .bold))
+                                        .foregroundStyle(pref.scope == .global ? Color(hex: 0xF5C542) : Color(hex: 0x38BDF8))
+                                        .padding(.horizontal, 5)
+                                        .padding(.vertical, 1.5)
+                                        .background(Capsule().fill(Theme.raised))
+                                    Text(pref.rule)
+                                        .font(.system(size: 10.5))
+                                        .foregroundStyle(Theme.textDim)
+                                        .lineLimit(2)
+                                    Spacer(minLength: 4)
+                                    Button {
+                                        bridge.deletePreference(id: pref.id)
+                                    } label: {
+                                        Image(systemName: "xmark")
+                                            .font(.system(size: 9, weight: .bold))
+                                            .foregroundStyle(Theme.textFaint)
+                                    }
+                                    .buttonStyle(.plain)
+                                    .help("Esquecer preferência")
+                                }
+                                .padding(.horizontal, 7)
+                                .padding(.vertical, 4)
+                                .background(RoundedRectangle(cornerRadius: 6, style: .continuous).fill(Theme.field.opacity(0.65)))
+                            }
+                        }
+                    }
+                    .frame(maxHeight: 120)
+                }
+            }
+
+            Divider().opacity(0.25)
+
+            // 4. Keychain status (never shows secrets)
+            HStack(spacing: 8) {
+                keyStatusChip(.openai, title: "OpenAI")
+                keyStatusChip(.xai, title: "xAI")
+                Spacer()
+                Text("⌘⇧M").font(Theme.mono(10, .medium)).foregroundStyle(Theme.textFaint)
+            }
+        }
+        .padding(14)
+        .frame(width: 392)
+        .background(Theme.panel)
+    }
+
+    private func saveQuickRule() {
+        let trimmed = newRule.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        bridge.addExplicitPreference(rule: trimmed, category: "style", scope: .global)
+        newRule = ""
+    }
+
+    private func keyStatusChip(_ provider: VoiceKeychain.Provider, title: String) -> some View {
+        let ok = VoiceKeychain.loadAPIKey(for: provider) != nil
+        return Button {
+            promptForAPIKey(provider: provider, title: title)
+        } label: {
+            HStack(spacing: 4) {
+                Circle().fill(ok ? Color(hex: 0x22C55E) : Color(hex: 0xF97316)).frame(width: 6, height: 6)
+                Text("\(title) Key").font(.system(size: 10.5, weight: .medium)).foregroundStyle(Theme.textDim)
+            }
+            .padding(.horizontal, 8)
+            .frame(height: 22)
+            .background(RoundedRectangle(cornerRadius: 6, style: .continuous).fill(Theme.field))
+        }
+        .buttonStyle(.plain)
+        .help(ok ? "\(title) configurada no Keychain (clique para atualizar)" : "Clique para salvar \(provider.envName) no Keychain")
+    }
+
+    private func promptForAPIKey(provider: VoiceKeychain.Provider, title: String) {
         let alert = NSAlert()
-        alert.messageText = "Chave xAI (XAI_API_KEY)"
-        alert.informativeText = "Cole sua chave da API xAI. Ela será salva com segurança apenas no Keychain do macOS (nunca em arquivos do projeto)."
+        alert.messageText = "Chave \(title) (\(provider.envName))"
+        alert.informativeText = "Salva com segurança apenas no Keychain do macOS (nunca em arquivos do projeto)."
         let field = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 24))
-        field.placeholderString = "xai-..."
+        field.placeholderString = provider == .openai ? "sk-..." : "xai-..."
         alert.accessoryView = field
         alert.addButton(withTitle: "Salvar no Keychain")
         alert.addButton(withTitle: "Cancelar")
         if alert.runModal() == .alertFirstButtonReturn {
             let key = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !key.isEmpty, VoiceKeychain.saveAPIKey(key) {
+            if !key.isEmpty, VoiceKeychain.saveAPIKey(key, for: provider) {
                 bridge.prewarm()
             }
         }

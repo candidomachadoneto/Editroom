@@ -1,14 +1,64 @@
 import Foundation
 
-/// Persistent WebSocket client for xAI Grok Voice 3.0 (`grok-voice-latest`) Realtime API.
-/// Follows the official schema verified on `docs.x.ai`:
-/// - Endpoint: `wss://api.x.ai/v1/realtime?model=grok-voice-latest`
-/// - `session.update` with `voice`, `instructions`, `turn_detection: server_vad`,
-///   `audio.input.format: {type: "audio/pcm", rate: 24000}` + `language_hint: "pt-BR"`,
-///   `audio.output.format: {type: "audio/pcm", rate: 24000}`, and `tools` (`get_state`, `exec_edit`).
-final class XAIRealtimeClient: NSObject, URLSessionWebSocketDelegate, @unchecked Sendable {
-    static let endpointURL = URL(string: "wss://api.x.ai/v1/realtime?model=grok-voice-latest")!
+/// Selectable Realtime Voice front-end engine (low-latency speech-to-speech over WebSocket).
+enum VoiceEngineModel: String, CaseIterable, Identifiable {
+    case openaiRealtimeMini = "gpt-realtime-2.1-mini"
+    case openaiRealtime = "gpt-realtime-2.1"
+    case xaiGrokVoice = "grok-voice-latest"
 
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .openaiRealtimeMini: return "GPT-2.1 Mini (Ultra-Rápido)"
+        case .openaiRealtime: return "GPT-2.1 Realtime (Pro)"
+        case .xaiGrokVoice: return "Grok Voice 3.0 (xAI)"
+        }
+    }
+
+    var shortLabel: String {
+        switch self {
+        case .openaiRealtimeMini: return "GPT-2.1 Mini"
+        case .openaiRealtime: return "GPT-2.1"
+        case .xaiGrokVoice: return "Grok Voice"
+        }
+    }
+
+    var provider: VoiceKeychain.Provider {
+        switch self {
+        case .openaiRealtimeMini, .openaiRealtime: return .openai
+        case .xaiGrokVoice: return .xai
+        }
+    }
+
+    var endpointURL: URL {
+        switch self {
+        case .openaiRealtimeMini, .openaiRealtime:
+            return URL(string: "wss://api.openai.com/v1/realtime?model=\(rawValue)")!
+        case .xaiGrokVoice:
+            return URL(string: "wss://api.x.ai/v1/realtime?model=grok-voice-latest")!
+        }
+    }
+}
+
+/// Turn-detection strategy: fast fixed silence (`server_vad`, 320ms) or meaning-aware (`semantic_vad`).
+enum VoiceVADMode: String, CaseIterable, Identifiable {
+    case fastServer = "server_vad"
+    case semantic = "semantic_vad"
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .fastServer: return "Ultra-Rápido (320ms)"
+        case .semantic: return "Semântico (inteligente)"
+        }
+    }
+}
+
+/// Unified persistent WebSocket client supporting BOTH OpenAI Realtime GA (`gpt-realtime-2.1-mini` / `gpt-realtime-2.1`)
+/// and xAI Grok Voice 3.0 (`grok-voice-latest`) over a single low-latency audio/tool protocol.
+final class RealtimeClient: NSObject, URLSessionWebSocketDelegate, @unchecked Sendable {
     enum Event {
         case connected
         case sessionReady
@@ -27,18 +77,18 @@ final class XAIRealtimeClient: NSObject, URLSessionWebSocketDelegate, @unchecked
     private var session: URLSession?
     private var task: URLSessionWebSocketTask?
     private var pingTimer: DispatchSourceTimer?
-    private let queue = DispatchQueue(label: "editroom.voicebridge.xai-ws", qos: .userInteractive)
+    private let queue = DispatchQueue(label: "editroom.voicebridge.realtime-ws", qos: .userInteractive)
     private var isOpen = false
     private var isClosing = false
     private var pendingMessages: [String] = []
     private var sessionConfigJSON: String = ""
+    private var currentModel: VoiceEngineModel = .openaiRealtimeMini
 
-    /// Builds the official `session.update` JSON payload for Grok Voice 3.0.
-    static func buildSessionUpdateJSON(instructions: String, voice: String = "Rex") -> String {
+    static func toolDefinitions() -> [[String: Any]] {
         let getStateTool: [String: Any] = [
             "type": "function",
             "name": "get_state",
-            "description": "Retorna o estado atual da timeline do Editroom (sequência, playhead, tracks, clipes com IDs/tempos, marcadores, legendas e mídia). Sempre consulte antes de assumir tempos ou IDs.",
+            "description": "Retorna o estado atualizado da timeline do Editroom (sequência, playhead, tracks, clipes com IDs/tempos, marcadores, legendas e mídia).",
             "parameters": [
                 "type": "object",
                 "properties": [String: Any](),
@@ -49,18 +99,15 @@ final class XAIRealtimeClient: NSObject, URLSessionWebSocketDelegate, @unchecked
         let execEditTool: [String: Any] = [
             "type": "function",
             "name": "exec_edit",
-            "description": "Envia um comando EditDSL JSON ao enxame local do Editroom (com pace 0.3 obrigatório e cursores coloridos ao vivo). Retorna spoken_feedback e eventuais erros por lane.",
+            "description": "Executa edição imediata no enxame local do Editroom (pace 0.3 obrigatório, parâmetros dentro de 'args', cursores coloridos ao vivo). Use para qualquer edição direta ou rápida.",
             "parameters": [
                 "type": "object",
                 "properties": [
                     "payload": [
                         "type": "object",
-                        "description": "Objeto JSON EditDSL com 'pace': 0.3 (obrigatório) e 'lanes': lista de {agent, ops:[{tool, target?, args:{...}, id_field?, batch_ids?, save_v?, save_a?, save_id?, save_split_v?}]}.",
+                        "description": "Objeto JSON EditDSL com 'pace': 0.3 e 'lanes': [{agent, ops:[{tool, target?, args:{...}, id_field?, batch_ids?}]}].",
                         "properties": [
-                            "pace": [
-                                "type": "number",
-                                "description": "Sempre 0.3 para ver os cursores trabalhando ao vivo. Nunca 0.0.",
-                            ],
+                            "pace": ["type": "number", "description": "Sempre 0.3."],
                             "lanes": [
                                 "type": "array",
                                 "items": [
@@ -68,14 +115,7 @@ final class XAIRealtimeClient: NSObject, URLSessionWebSocketDelegate, @unchecked
                                     "properties": [
                                         "agent": [
                                             "type": "string",
-                                            "enum": [
-                                                "Grok-Diretor",
-                                                "Grok-Cortador",
-                                                "Grok-Prints",
-                                                "Grok-Titulos",
-                                                "Grok-Colorista",
-                                                "Grok-Audio",
-                                            ],
+                                            "enum": ["Grok-Diretor", "Grok-Cortador", "Grok-Prints", "Grok-Titulos", "Grok-Colorista", "Grok-Audio"],
                                         ],
                                         "ops": [
                                             "type": "array",
@@ -103,38 +143,113 @@ final class XAIRealtimeClient: NSObject, URLSessionWebSocketDelegate, @unchecked
             ],
         ]
 
-        let event: [String: Any] = [
-            "type": "session.update",
-            "session": [
-                "voice": voice,
-                "instructions": instructions,
-                "turn_detection": [
-                    "type": "server_vad",
-                    "threshold": 0.5,
-                    "prefix_padding_ms": 300,
-                    "silence_duration_ms": 450,
-                ],
-                "audio": [
-                    "input": [
-                        "format": [
-                            "type": "audio/pcm",
-                            "rate": 24000,
-                        ],
-                        "transcription": [
-                            "language_hint": "pt-BR",
-                        ],
-                    ],
-                    "output": [
-                        "format": [
-                            "type": "audio/pcm",
-                            "rate": 24000,
-                        ],
+        let orchestrateTool: [String: Any] = [
+            "type": "function",
+            "name": "orchestrate_models",
+            "description": "Delega uma edição complexa, criativa ou multi-frente para o time de modelos especialistas (Gemini 4, Claude Fable, Grok 4.7 e/ou OpenAI) planejarem em paralelo por especialidade e executarem sem colisão na timeline com cursores coloridos.",
+            "parameters": [
+                "type": "object",
+                "properties": [
+                    "goal": ["type": "string", "description": "Objetivo editorial completo pedido pelo usuário."],
+                    "models": [
+                        "type": "array",
+                        "items": ["type": "string", "enum": ["openai", "claude", "gemini", "grok"]],
+                        "description": "Opcional: modelos específicos pedidos pelo usuário (se omitido, usa os modelos ativos no painel Magic).",
                     ],
                 ],
-                "tools": [getStateTool, execEditTool],
-                "tool_choice": "auto",
+                "required": ["goal"],
             ],
         ]
+
+        let rememberTool: [String: Any] = [
+            "type": "function",
+            "name": "remember_preference",
+            "description": "Salva uma preferência de edição que o usuário expressou ('gostei disso', 'sempre faz assim', 'neste vídeo não usa zoom') para o editor aprender e se auto-aperfeiçoar.",
+            "parameters": [
+                "type": "object",
+                "properties": [
+                    "rule": ["type": "string", "description": "Regra curta e clara do gosto editorial do usuário."],
+                    "category": ["type": "string", "enum": ["cut", "framing", "color", "audio", "titles", "captions", "style"]],
+                    "scope": ["type": "string", "enum": ["global", "project"], "description": "'global' = sempre em todos os vídeos; 'project' = apenas neste vídeo."],
+                ],
+                "required": ["rule", "category", "scope"],
+            ],
+        ]
+
+        let forgetTool: [String: Any] = [
+            "type": "function",
+            "name": "forget_preference",
+            "description": "Remove uma preferência de edição salva anteriormente quando o usuário pedir para esquecer ou mudar de ideia.",
+            "parameters": [
+                "type": "object",
+                "properties": [
+                    "query": ["type": "string", "description": "Palavra-chave da preferência a remover."],
+                ],
+                "required": ["query"],
+            ],
+        ]
+
+        return [getStateTool, execEditTool, orchestrateTool, rememberTool, forgetTool]
+    }
+
+    static func buildSessionUpdateJSON(model: VoiceEngineModel, instructions: String, vadMode: VoiceVADMode) -> String {
+        let tools = toolDefinitions()
+        let event: [String: Any]
+
+        switch model.provider {
+        case .openai:
+            let turnDetection: [String: Any] = vadMode == .semantic
+                ? ["type": "semantic_vad", "eagerness": "high", "interrupt_response": true]
+                : ["type": "server_vad", "threshold": 0.5, "prefix_padding_ms": 250, "silence_duration_ms": 320, "interrupt_response": true]
+            event = [
+                "type": "session.update",
+                "session": [
+                    "type": "realtime",
+                    "model": model.rawValue,
+                    "instructions": instructions,
+                    "output_modalities": ["audio"],
+                    "audio": [
+                        "input": [
+                            "format": ["type": "audio/pcm", "rate": 24000],
+                            "turn_detection": turnDetection,
+                        ],
+                        "output": [
+                            "format": ["type": "audio/pcm", "rate": 24000],
+                            "voice": "cedar",
+                        ],
+                    ],
+                    "tools": tools,
+                    "tool_choice": "auto",
+                ],
+            ]
+
+        case .xai:
+            event = [
+                "type": "session.update",
+                "session": [
+                    "voice": "Rex",
+                    "instructions": instructions,
+                    "turn_detection": [
+                        "type": "server_vad",
+                        "threshold": 0.5,
+                        "prefix_padding_ms": 260,
+                        "silence_duration_ms": 360,
+                    ],
+                    "audio": [
+                        "input": [
+                            "format": ["type": "audio/pcm", "rate": 24000],
+                            "transcription": ["language_hint": "pt-BR"],
+                        ],
+                        "output": [
+                            "format": ["type": "audio/pcm", "rate": 24000],
+                        ],
+                    ],
+                    "tools": tools,
+                    "tool_choice": "auto",
+                ],
+            ]
+        }
+
         guard let data = try? JSONSerialization.data(withJSONObject: event, options: []),
               let str = String(data: data, encoding: .utf8) else { return "{}" }
         return str
@@ -144,12 +259,17 @@ final class XAIRealtimeClient: NSObject, URLSessionWebSocketDelegate, @unchecked
         queue.sync { isOpen && task != nil && !isClosing }
     }
 
-    func connect(apiKey: String, instructions: String, voice: String = "Rex") {
+    var activeModel: VoiceEngineModel {
+        queue.sync { currentModel }
+    }
+
+    func connect(model: VoiceEngineModel, apiKey: String, instructions: String, vadMode: VoiceVADMode) {
         queue.async { [weak self] in
             guard let self else { return }
             self.teardownLocked(notify: false)
             self.isClosing = false
-            self.sessionConfigJSON = Self.buildSessionUpdateJSON(instructions: instructions, voice: voice)
+            self.currentModel = model
+            self.sessionConfigJSON = Self.buildSessionUpdateJSON(model: model, instructions: instructions, vadMode: vadMode)
 
             let cfg = URLSessionConfiguration.default
             cfg.timeoutIntervalForRequest = 30
@@ -159,7 +279,7 @@ final class XAIRealtimeClient: NSObject, URLSessionWebSocketDelegate, @unchecked
             let sess = URLSession(configuration: cfg, delegate: self, delegateQueue: opQueue)
             self.session = sess
 
-            var req = URLRequest(url: Self.endpointURL)
+            var req = URLRequest(url: model.endpointURL)
             req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
             let ws = sess.webSocketTask(with: req)
             self.task = ws
@@ -169,30 +289,37 @@ final class XAIRealtimeClient: NSObject, URLSessionWebSocketDelegate, @unchecked
         }
     }
 
+    /// Hot-updates session instructions mid-connection (e.g. after timeline state refresh or new learned taste).
+    func updateSession(model: VoiceEngineModel, instructions: String, vadMode: VoiceVADMode) {
+        let json = Self.buildSessionUpdateJSON(model: model, instructions: instructions, vadMode: vadMode)
+        queue.async { [weak self] in
+            guard let self else { return }
+            self.sessionConfigJSON = json
+            if self.isOpen, let ws = self.task, !self.isClosing {
+                ws.send(.string(json)) { _ in }
+            }
+        }
+    }
+
     func disconnect() {
         queue.async { [weak self] in
             self?.teardownLocked(notify: false)
         }
     }
 
-    /// Streams raw PCM16 24kHz mono audio chunk immediately (`input_audio_buffer.append`).
     func sendAudioChunk(_ pcmData: Data) {
         let b64 = pcmData.base64EncodedString()
-        let msg = "{\"type\":\"input_audio_buffer.append\",\"audio\":\"\(b64)\"}"
-        sendRawJSON(msg, queueIfOpening: true)
+        sendRawJSON("{\"type\":\"input_audio_buffer.append\",\"audio\":\"\(b64)\"}", queueIfOpening: true)
     }
 
-    /// Discards any buffered un-committed mic audio when stopping listening.
     func clearInputAudioBuffer() {
         sendRawJSON("{\"type\":\"input_audio_buffer.clear\"}", queueIfOpening: false)
     }
 
-    /// Cancels an active model response (used on barge-in interruption or manual stop).
     func cancelResponse() {
         sendRawJSON("{\"type\":\"response.cancel\"}", queueIfOpening: false)
     }
 
-    /// Sends function call output back to Grok Voice 3.0 and triggers spoken continuation.
     func sendFunctionOutput(callID: String, outputJSON: String) {
         let itemEvent: [String: Any] = [
             "type": "conversation.item.create",
@@ -214,7 +341,6 @@ final class XAIRealtimeClient: NSObject, URLSessionWebSocketDelegate, @unchecked
             guard let self, !self.isClosing else { return }
             guard self.isOpen, let ws = self.task else {
                 if queueIfOpening {
-                    // Cap pre-open audio buffer to ~1.5s (~35 chunks) so memory stays bounded.
                     if self.pendingMessages.count > 35 { self.pendingMessages.removeFirst() }
                     self.pendingMessages.append(text)
                 }
@@ -260,14 +386,10 @@ final class XAIRealtimeClient: NSObject, URLSessionWebSocketDelegate, @unchecked
                 switch result {
                 case .success(let message):
                     switch message {
-                    case .string(let text):
-                        self.handleServerText(text)
+                    case .string(let text): self.handleServerText(text)
                     case .data(let data):
-                        if let text = String(data: data, encoding: .utf8) {
-                            self.handleServerText(text)
-                        }
-                    @unknown default:
-                        break
+                        if let text = String(data: data, encoding: .utf8) { self.handleServerText(text) }
+                    @unknown default: break
                     }
                     self.receiveNextLocked(ws)
                 case .failure(let error):
@@ -283,9 +405,7 @@ final class XAIRealtimeClient: NSObject, URLSessionWebSocketDelegate, @unchecked
               let type = json["type"] as? String else { return }
 
         switch type {
-        case "session.created":
-            onEvent?(.sessionReady)
-        case "session.updated":
+        case "session.created", "session.updated":
             onEvent?(.sessionReady)
         case "input_audio_buffer.speech_started":
             onEvent?(.speechStarted)
@@ -310,7 +430,7 @@ final class XAIRealtimeClient: NSObject, URLSessionWebSocketDelegate, @unchecked
             }
         case "error":
             let errObj = json["error"] as? [String: Any]
-            let msg = (errObj?["message"] as? String) ?? (json["message"] as? String) ?? "Erro na sessão de voz xAI."
+            let msg = (errObj?["message"] as? String) ?? (json["message"] as? String) ?? "Erro na sessão de voz."
             onEvent?(.serverError(msg))
         default:
             break
@@ -327,12 +447,8 @@ final class XAIRealtimeClient: NSObject, URLSessionWebSocketDelegate, @unchecked
         task = nil
         session?.invalidateAndCancel()
         session = nil
-        if notify {
-            onEvent?(.disconnected(error))
-        }
+        if notify { onEvent?(.disconnected(error)) }
     }
-
-    // MARK: URLSessionWebSocketDelegate
 
     func urlSession(_ session: URLSession, webSocketTask: URLSessionWebSocketTask, didOpenWithProtocol protocol: String?) {
         queue.async { [weak self] in
@@ -347,7 +463,7 @@ final class XAIRealtimeClient: NSObject, URLSessionWebSocketDelegate, @unchecked
                     didCloseWith closeCode: URLSessionWebSocketTask.CloseCode, reason: Data?) {
         queue.async { [weak self] in
             guard let self, self.task === webSocketTask, !self.isClosing else { return }
-            let err = NSError(domain: "XAIRealtimeClient", code: Int(closeCode.rawValue),
+            let err = NSError(domain: "RealtimeClient", code: Int(closeCode.rawValue),
                               userInfo: [NSLocalizedDescriptionKey: "Conexão de voz encerrada (código \(closeCode.rawValue))."])
             self.teardownLocked(notify: true, error: err)
         }
