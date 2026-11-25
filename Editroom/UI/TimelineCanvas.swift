@@ -11,7 +11,7 @@ struct TimelineCanvasView: NSViewRepresentable {
 
 /// The playhead lives in its own layer-backed view so moving it never redraws the clips.
 final class PlayheadView: NSView {
-    static let width: CGFloat = 16
+    static let width: CGFloat = 22
 
     override var isFlipped: Bool { true }
     override func hitTest(_ point: NSPoint) -> NSView? { nil }
@@ -19,24 +19,50 @@ final class PlayheadView: NSView {
     override func draw(_ dirtyRect: NSRect) {
         guard let ctx = NSGraphicsContext.current?.cgContext else { return }
         let mid = bounds.midX
-        let l = mid - 5.5, r = mid + 5.5
-        let top: CGFloat = 5, shoulder: CGFloat = 13, tip: CGFloat = 19, rad: CGFloat = 3
-        // One closed shape: rounded cap narrowing to a point, with the stem running straight out of the tip.
-        let p = CGMutablePath()
-        p.move(to: CGPoint(x: l, y: top + rad))
-        p.addArc(tangent1End: CGPoint(x: l, y: top), tangent2End: CGPoint(x: l + rad, y: top), radius: rad)
-        p.addLine(to: CGPoint(x: r - rad, y: top))
-        p.addArc(tangent1End: CGPoint(x: r, y: top), tangent2End: CGPoint(x: r, y: top + rad), radius: rad)
-        p.addLine(to: CGPoint(x: r, y: shoulder))
-        p.addLine(to: CGPoint(x: mid + 0.5, y: tip))
-        p.addLine(to: CGPoint(x: mid + 0.5, y: bounds.height))
-        p.addLine(to: CGPoint(x: mid - 0.5, y: bounds.height))
-        p.addLine(to: CGPoint(x: mid - 0.5, y: tip))
-        p.addLine(to: CGPoint(x: l, y: shoulder))
-        p.closeSubpath()
-        ctx.addPath(p)
-        ctx.setFillColor(Theme.NS.accent.cgColor)
+        let capHalf: CGFloat = 7.5
+        let l = mid - capHalf, r = mid + capHalf
+        let top: CGFloat = 2, shoulder: CGFloat = 15, tip: CGFloat = 23, rad: CGFloat = 3.5
+
+        // High-contrast vivid cyan needle with dark halo so it pops over every thumbnail, text, and marker.
+        let needleColor = NSColor(srgbRed: 0.22, green: 0.74, blue: 0.97, alpha: 1) // #38BDF8
+        let coreHighlight = NSColor.white.withAlphaComponent(0.92)
+
+        // Subtle dark outer halo behind the vertical stem for legibility over bright frames.
+        ctx.setFillColor(NSColor.black.withAlphaComponent(0.65).cgColor)
+        ctx.fill(CGRect(x: mid - 2.0, y: tip - 2, width: 4.0, height: bounds.height - tip + 2))
+
+        // Vivid 2px vertical stem + bright center filament.
+        ctx.setFillColor(needleColor.cgColor)
+        ctx.fill(CGRect(x: mid - 1.0, y: tip - 2, width: 2.0, height: bounds.height - tip + 2))
+        ctx.setFillColor(coreHighlight.cgColor)
+        ctx.fill(CGRect(x: mid - 0.5, y: tip, width: 1.0, height: bounds.height - tip))
+
+        // Sculpted scrubber head sitting cleanly inside the top timecode ruler.
+        let head = CGMutablePath()
+        head.move(to: CGPoint(x: l, y: top + rad))
+        head.addArc(tangent1End: CGPoint(x: l, y: top), tangent2End: CGPoint(x: l + rad, y: top), radius: rad)
+        head.addLine(to: CGPoint(x: r - rad, y: top))
+        head.addArc(tangent1End: CGPoint(x: r, y: top), tangent2End: CGPoint(x: r, y: top + rad), radius: rad)
+        head.addLine(to: CGPoint(x: r, y: shoulder))
+        head.addLine(to: CGPoint(x: mid, y: tip))
+        head.addLine(to: CGPoint(x: l, y: shoulder))
+        head.closeSubpath()
+
+        ctx.saveGState()
+        ctx.setShadow(offset: CGSize(width: 0, height: 1), blur: 3, color: NSColor.black.withAlphaComponent(0.65).cgColor)
+        ctx.addPath(head)
+        ctx.setFillColor(needleColor.cgColor)
         ctx.fillPath()
+        ctx.restoreGState()
+
+        ctx.addPath(head)
+        ctx.setStrokeColor(NSColor.white.withAlphaComponent(0.85).cgColor)
+        ctx.setLineWidth(1)
+        ctx.strokePath()
+
+        // Crisp center notch inside the cap indicating exact frame center.
+        ctx.setFillColor(NSColor.white.withAlphaComponent(0.95).cgColor)
+        ctx.fill(CGRect(x: mid - 0.75, y: top + 4, width: 1.5, height: 7))
     }
 }
 
@@ -381,8 +407,10 @@ final class TimelineCanvas: NSView {
         var newCut: (id: UUID, time: Double)?
         var newCursor = NSCursor.arrow
 
-        if p.y < TimelineLayout.ruler {
-            newCursor = .arrow
+        if p.y < TimelineLayout.timeRuler {
+            newCursor = .pointingHand
+        } else if p.y < TimelineLayout.ruler {
+            newCursor = markerHit(at: p) != nil ? .pointingHand : .arrow
         } else if model.tool == .cut {
             newCursor = Cursors.cut
             if let h = hit(at: p) {
@@ -426,19 +454,27 @@ final class TimelineCanvas: NSView {
         let extend = event.modifierFlags.contains(.shift)
 
         if p.y < TimelineLayout.ruler {
-            // The playhead sits on top of markers, so near it a click takes the playhead; a marker
-            // under it can still be clicked by its name.
-            let onPlayhead = abs(p.x - x(model.playhead)) <= 6
+            let onPlayhead = abs(p.x - x(model.playhead)) <= 9
+            // Top timecode ruler band: clicking anywhere jumps the playhead needle immediately.
+            if p.y < TimelineLayout.timeRuler {
+                if !onPlayhead, let isIn = rangeEdgeHit(at: p) {
+                    drag = .rangeEdge(isIn: isIn)
+                    return
+                }
+                drag = .scrub
+                scrub(to: p)
+                tick()
+                return
+            }
+            // Dedicated marker lane underneath the timecode ruler: click a marker flag/name to edit
+            // or drag it; clicking empty space still moves the playhead needle right there.
             if !onPlayhead, let id = markerHit(at: p) {
                 drag = .marker(id: id, startX: p.x, moved: false)
                 return
             }
-            if !onPlayhead, let isIn = rangeEdgeHit(at: p) {
-                drag = .rangeEdge(isIn: isIn)
-                return
-            }
             drag = .scrub
             scrub(to: p)
+            tick()
             return
         }
 
@@ -1500,9 +1536,21 @@ final class TimelineCanvas: NSView {
     ]
 
     private func drawRuler(_ ctx: CGContext, project: Project) {
+        let timeBand = TimelineLayout.timeRuler
         let ruler = TimelineLayout.ruler
+
+        // 1. Top dedicated timecode ruler band (always visible, never covered by markers).
         Theme.NS.panel.setFill()
-        CGRect(x: 0, y: 0, width: bounds.width, height: ruler).fill()
+        CGRect(x: 0, y: 0, width: bounds.width, height: timeBand).fill()
+        // Subtle elevated tint so the clickable ruler reads distinctly from the tracks below.
+        ctx.setFillColor(Theme.NS.ink(0.035).cgColor)
+        ctx.fill(CGRect(x: 0, y: 0, width: bounds.width, height: timeBand))
+        ctx.setFillColor(Theme.NS.stroke.cgColor)
+        ctx.fill(CGRect(x: 0, y: timeBand - 1, width: bounds.width, height: 1))
+
+        // 2. Dedicated marker lane underneath the timecode ruler.
+        Theme.NS.panel.setFill()
+        CGRect(x: 0, y: timeBand, width: bounds.width, height: ruler - timeBand).fill()
         ctx.setFillColor(Theme.NS.stroke.cgColor)
         ctx.fill(CGRect(x: 0, y: ruler - 1, width: bounds.width, height: 1))
 
@@ -1513,7 +1561,7 @@ final class TimelineCanvas: NSView {
             (60, 6), (120, 4), (300, 5), (600, 5), (900, 3), (1800, 6), (3600, 6), (7200, 4), (18000, 5), (36000, 5),
         ]
         var step = steps.last!
-        for s in steps where CGFloat(s.0) * pps >= 86 && (s.0 >= 1 || s.0 < 0.5) {
+        for s in steps where CGFloat(s.0) * pps >= 76 && (s.0 >= 1 || s.0 < 0.5) {
             step = s
             break
         }
@@ -1521,35 +1569,60 @@ final class TimelineCanvas: NSView {
         let t0 = time(atX: 0), t1 = time(atX: bounds.width)
         var k = Int(floor(t0 / major))
         let showFrames = major < 1
+        let crispRulerAttrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.monospacedDigitSystemFont(ofSize: 10.5, weight: .medium),
+            .foregroundColor: Theme.NS.text.withAlphaComponent(0.82),
+        ]
         while Double(k) * major <= t1 {
             let t = Double(k) * major
             let px = x(t)
             if t >= 0 {
-                ctx.setFillColor(Theme.NS.ink(0.28).cgColor)
-                ctx.fill(CGRect(x: px.rounded(), y: ruler - 9, width: 1, height: 8))
+                ctx.setFillColor(Theme.NS.ink(0.55).cgColor)
+                ctx.fill(CGRect(x: px.rounded(), y: timeBand - 11, width: 1, height: 10))
                 var label = Timecode.short(t)
                 if showFrames {
                     if TimeStyle.current == .simple {
-                        // Zoomed in, with plain times: hundredths, as the viewer shows them.
                         label = Timecode.simple(t)
                     } else {
                         let frames = Int((t * fps).rounded()) % max(1, Int(fps.rounded()))
                         label = Timecode.short(floor(t + 1e-6)) + String(format: ":%02d", frames)
                     }
                 }
-                (label as NSString).draw(at: CGPoint(x: px + 5, y: 5), withAttributes: Self.rulerAttrs)
+                (label as NSString).draw(at: CGPoint(x: px + 5, y: 4), withAttributes: crispRulerAttrs)
             }
             if subdivisions > 1 {
-                ctx.setFillColor(Theme.NS.ink(0.13).cgColor)
                 for j in 1..<subdivisions {
                     let mt = t + major * Double(j) / Double(subdivisions)
-                    if mt >= 0 { ctx.fill(CGRect(x: x(mt).rounded(), y: ruler - 5, width: 1, height: 4)) }
+                    if mt >= 0 {
+                        let isHalf = subdivisions % 2 == 0 && j == subdivisions / 2
+                        ctx.setFillColor(Theme.NS.ink(isHalf ? 0.34 : 0.20).cgColor)
+                        let h: CGFloat = isHalf ? 7 : 4
+                        ctx.fill(CGRect(x: x(mt).rounded(), y: timeBand - h - 1, width: 1, height: h))
+                    }
                 }
             }
             k += 1
         }
 
-        // Markers: a coloured flag with the name beside it.
+        // In/out: highlighted inside the timecode ruler band with white brackets at each end.
+        if project.inPoint != nil || project.outPoint != nil {
+            let a = project.inPoint.map { x($0) }, b = project.outPoint.map { x($0) }
+            if let r = project.playRange {
+                ctx.setFillColor(Theme.NS.ink(0.08).cgColor)
+                ctx.fill(CGRect(x: x(r.start), y: 0, width: x(r.end) - x(r.start), height: timeBand - 1))
+            }
+            ctx.setFillColor(Theme.NS.ink.cgColor)
+            for (edge, inward) in [(a, CGFloat(1)), (b, CGFloat(-1))] {
+                guard let ex = edge?.rounded() else { continue }
+                ctx.fill(CGRect(x: ex - 1, y: 2, width: 2, height: timeBand - 3))
+                ctx.fill(CGRect(x: inward > 0 ? ex - 1 : ex - 5, y: 2, width: 6, height: 2))
+                ctx.fill(CGRect(x: inward > 0 ? ex - 1 : ex - 5, y: timeBand - 3, width: 6, height: 2))
+            }
+        }
+
+        // Markers: cleanly placed in their own lane underneath the timecode ruler.
+        let my = timeBand + 2
+        let mh = ruler - timeBand - 3
         for m in project.markerList {
             let mx = x(m.time).rounded()
             let label = markerLabel(m)
@@ -1557,35 +1630,19 @@ final class TimelineCanvas: NSView {
             let color = NSColor(hex: m.tint.hex)
             let size = label.size()
             ctx.setFillColor(Theme.NS.panel.cgColor)
-            ctx.fill(CGRect(x: mx + 1, y: 3, width: size.width + 14, height: ruler - 5))
+            ctx.fill(CGRect(x: mx + 1, y: my, width: size.width + 13, height: mh))
             ctx.setFillColor(color.cgColor)
-            ctx.fill(CGRect(x: mx, y: 4, width: 1, height: ruler - 5))
+            ctx.fill(CGRect(x: mx, y: my, width: 1, height: mh))
             let flag = CGMutablePath()
-            flag.move(to: CGPoint(x: mx, y: 4))
-            flag.addLine(to: CGPoint(x: mx + 8, y: 4))
-            flag.addLine(to: CGPoint(x: mx + 6, y: 8))
-            flag.addLine(to: CGPoint(x: mx + 8, y: 12))
-            flag.addLine(to: CGPoint(x: mx, y: 12))
+            flag.move(to: CGPoint(x: mx, y: my + 1))
+            flag.addLine(to: CGPoint(x: mx + 7, y: my + 1))
+            flag.addLine(to: CGPoint(x: mx + 5, y: my + 5))
+            flag.addLine(to: CGPoint(x: mx + 7, y: my + 9))
+            flag.addLine(to: CGPoint(x: mx, y: my + 9))
             flag.closeSubpath()
             ctx.addPath(flag)
             ctx.fillPath()
-            label.draw(at: CGPoint(x: mx + 11, y: 5))
-        }
-
-        // In/out: the stretch between is lit, with a white bracket at each end.
-        if project.inPoint != nil || project.outPoint != nil {
-            let a = project.inPoint.map { x($0) }, b = project.outPoint.map { x($0) }
-            if let r = project.playRange {
-                ctx.setFillColor(Theme.NS.ink(0.06).cgColor)
-                ctx.fill(CGRect(x: x(r.start), y: 0, width: x(r.end) - x(r.start), height: ruler - 1))
-            }
-            ctx.setFillColor(Theme.NS.ink.cgColor)
-            for (edge, inward) in [(a, CGFloat(1)), (b, CGFloat(-1))] {
-                guard let ex = edge?.rounded() else { continue }
-                ctx.fill(CGRect(x: ex - 1, y: 2, width: 2, height: ruler - 3))
-                ctx.fill(CGRect(x: inward > 0 ? ex - 1 : ex - 5, y: 2, width: 6, height: 2))
-                ctx.fill(CGRect(x: inward > 0 ? ex - 1 : ex - 5, y: ruler - 3, width: 6, height: 2))
-            }
+            label.draw(at: CGPoint(x: mx + 10, y: my + 1))
         }
     }
 
@@ -1659,7 +1716,7 @@ final class TimelineCanvas: NSView {
 
     private func markerAnchor(_ m: Marker) -> CGRect {
         let mx = min(max(4, x(m.time)), bounds.width - 4)
-        return CGRect(x: mx, y: 0, width: 8, height: TimelineLayout.ruler)
+        return CGRect(x: mx, y: TimelineLayout.timeRuler, width: 8, height: TimelineLayout.markerBand)
     }
 
     private func drawClip(_ c: Clip, ctx: CGContext, alpha: CGFloat) {

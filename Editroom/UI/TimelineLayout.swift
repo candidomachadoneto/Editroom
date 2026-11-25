@@ -2,7 +2,12 @@ import AppKit
 
 /// Vertical arrangement of the timeline, shared by the canvas and the track headers.
 struct TimelineLayout {
-    static let ruler: CGFloat = 26
+    /// Top dedicated timecode ruler band (ticks & timestamps — never covered by markers).
+    static let timeRuler: CGFloat = 26
+    /// Dedicated marker flag lane right underneath the timecode ruler.
+    static let markerBand: CGFloat = 18
+    /// Combined header band above the track rows.
+    static let ruler: CGFloat = timeRuler + markerBand
     static let zone: CGFloat = 26
     static let gap: CGFloat = 1
     static let divider: CGFloat = 9

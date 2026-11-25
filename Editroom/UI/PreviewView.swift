@@ -674,17 +674,32 @@ struct TransportBar: View {
 
     var body: some View {
         let fps = model.project.fps
-        ZStack {
-            HStack(alignment: .center, spacing: 10) {
-                HStack(alignment: .firstTextBaseline, spacing: 10) {
-                    TimecodeField(time: Double(clock.frame) / fps, fps: fps) { model.seek(to: $0) }
-                    Text("/ " + Timecode.string(model.project.duration, fps: fps))
-                        .font(Theme.mono(11.5, .regular))
-                        .foregroundStyle(Theme.textFaint)
-                }
-                Spacer()
+        HStack(alignment: .center, spacing: 10) {
+            // Left: current timecode + total duration (never overlaps transport buttons on narrow windows).
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                TimecodeField(time: Double(clock.frame) / fps, fps: fps) { model.seek(to: $0) }
+                Text("/ " + Timecode.string(model.project.duration, fps: fps))
+                    .font(Theme.mono(11, .regular))
+                    .foregroundStyle(Theme.textFaint)
+                    .lineLimit(1)
+                    .fixedSize()
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            // Center: playback controls.
+            HStack(alignment: .center, spacing: 4) {
+                IconButton(symbol: "backward.end.fill", size: 30, help: "Previous Edit (↑ or ⇧←)") { model.jumpToEdit(forward: false) }
+                IconButton(symbol: "backward.frame.fill", size: 30, help: "Back One Frame (←)") { model.step(frames: -1) }
+                PlayButton(playing: model.isPlaying) { model.togglePlay() }
+                    .padding(.horizontal, 8)
+                IconButton(symbol: "forward.frame.fill", size: 30, help: "Forward One Frame (→)") { model.step(frames: 1) }
+                IconButton(symbol: "forward.end.fill", size: 30, help: "Next Edit (↓ or ⇧→)") { model.jumpToEdit(forward: true) }
+            }
+            .fixedSize()
+
+            // Right: loop, meters, zoom, fullscreen.
+            HStack(alignment: .center, spacing: 8) {
                 IconButton(symbol: "repeat", active: model.loop, size: 28, help: "Loop Playback (L)") { model.loop.toggle() }
-                // Output level, left and right.
                 HStack(spacing: 2) {
                     LevelMeter(meters: meters, side: .left).frame(width: 4)
                     LevelMeter(meters: meters, side: .right).frame(width: 4)
@@ -718,14 +733,7 @@ struct TransportBar: View {
                     model.toggleViewerFullScreen()
                 }
             }
-            HStack(alignment: .center, spacing: 4) {
-                IconButton(symbol: "backward.end.fill", size: 32, help: "Previous Edit (↑ or ⇧←)") { model.jumpToEdit(forward: false) }
-                IconButton(symbol: "backward.frame.fill", size: 32, help: "Back One Frame (←)") { model.step(frames: -1) }
-                PlayButton(playing: model.isPlaying) { model.togglePlay() }
-                    .padding(.horizontal, 10)
-                IconButton(symbol: "forward.frame.fill", size: 32, help: "Forward One Frame (→)") { model.step(frames: 1) }
-                IconButton(symbol: "forward.end.fill", size: 32, help: "Next Edit (↓ or ⇧→)") { model.jumpToEdit(forward: true) }
-            }
+            .frame(maxWidth: .infinity, alignment: .trailing)
         }
         .padding(.horizontal, 16)
         .frame(height: 76)
@@ -850,8 +858,8 @@ private struct TimecodeField: View {
                 Text(Timecode.string(time, fps: fps))
             }
         }
-        .font(Theme.mono(20, .medium))
-        .kerning(0.4)
+        .font(Theme.mono(16, .medium))
+        .kerning(0.3)
         .foregroundStyle(Theme.text)
         .fixedSize()
         .padding(.horizontal, 7)
