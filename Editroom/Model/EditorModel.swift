@@ -1950,6 +1950,7 @@ final class EditorModel: ObservableObject {
                 if let g = gains[p.clips[i].id] { p.clips[i].gainDB = g.clamped(to: -24...12) }
             }
         }
+        dispatchVisualSwarm(mission: "Audio Leveling", waves: [(.audio, "Level", Set(gains.keys), false)])
     }
 
     /// The clip gain that brings each audio clip to the same typical level, measured from its waveform
@@ -2190,6 +2191,7 @@ final class EditorModel: ObservableObject {
             }
         }
         AppleHaptics.align()
+        dispatchVisualSwarm(mission: "Face Auto-Reframe", waves: [(.framer, "Face Track", Set(updates.keys), true)])
         showToast("Auto-reframed \(updates.count) clip\(updates.count == 1 ? "" : "s") on face")
         return updates.count
     }
@@ -2273,6 +2275,8 @@ final class EditorModel: ObservableObject {
         }
         if applied > 0 {
             AppleHaptics.align()
+            let remainingAudio = Set(project.clips.filter { $0.kind == .audio }.map(\.id))
+            dispatchVisualSwarm(mission: "Silence Removal", waves: [(.cutter, "Cut silence", remainingAudio, false)])
             showToast(String(format: "Removed %d silence%@ (-%.1fs)", applied, applied == 1 ? "" : "s", totalTrimmed))
         }
         return applied
@@ -2375,9 +2379,166 @@ final class EditorModel: ObservableObject {
 
         let framed = await autoReframeFaces(clipIDs: v1Clips)
         let silences = removeSilences(clipIDs: a1Clips)
+        let allA1 = Set(project.clips.filter { $0.trackID == a1ID && $0.kind == .audio }.map(\.id))
+        let allV1 = Set(project.clips.filter { $0.trackID == v1ID && ($0.kind == .video || $0.kind == .image) }.map(\.id))
+        dispatchVisualSwarm(mission: "News Reel 9:16 Swarm", waves: [
+            (.framer, "9:16 Face Track", allV1, true),
+            (.cards, "Keep Card + Polish", overlayClips, true),
+            (.motion, "Slide Down", overlayClips, false),
+            (.audio, "Voice Enhance", allA1, false),
+            (.cutter, silences > 0 ? "Cut \(silences) silences" : "Sync cuts", allA1, false),
+        ])
         let summary = "News Reel 9:16: \(framed) reframed, \(overlayClips.count) card(s) polished, Voice Enhance ON, \(silences) silences cut"
         showToast(summary, seconds: 4.0)
         return summary
+    }
+
+    // MARK: Visual Nano-Bot Swarm Engine (Default Multi-Agent Choreography)
+
+    /// Launches coordinated multi-squad nano-bot cursors across the Timeline and Preview for any action.
+    /// Each wave tuple spawns 1..3 parallel bots of that squad's color hopping cleanly across target clips.
+    func dispatchVisualSwarm(mission: String, waves: [(squad: SwarmSquad, action: String, clipIDs: Set<UUID>, showInPreview: Bool)]) {
+        guard AgentPresence.enabled, let canvas = TimelineCanvas.current, let window = canvas.window, window.isVisible else { return }
+        let viewerWinRect = MagicAnchors.rect("viewer")
+        let tlWinRect = canvas.convert(canvas.bounds, to: nil)
+        func toOverlay(_ r: NSRect) -> CGRect {
+            CGRect(x: r.minX, y: window.frame.height - r.maxY, width: r.width, height: r.height)
+        }
+        var jobs: [SwarmJob] = []
+        let project = self.project
+        let t = playhead
+
+        for (waveIdx, wave) in waves.enumerated() {
+            let clips = project.clips
+                .filter { wave.clipIDs.contains($0.id) }
+                .sorted { $0.start < $1.start }
+            let targetClips = Array(clips.prefix(9))
+            let botCount = max(1, min(3, targetClips.count))
+
+            if targetClips.isEmpty {
+                // Still show a crisp squad nano-bot pulsing on the preview or timeline center.
+                let baseRect = toOverlay(wave.showInPreview ? (viewerWinRect ?? tlWinRect) : tlWinRect)
+                let offset = CGFloat(waveIdx - waves.count / 2) * 52
+                let pt = CGPoint(x: baseRect.midX + offset, y: baseRect.midY)
+                jobs.append(SwarmJob(botID: "swarm-\(wave.squad.rawValue)-0", squad: wave.squad, action: wave.action,
+                                     target: pt, highlightRect: nil, delay: Double(waveIdx) * 0.04))
+                continue
+            }
+
+            for (idx, clip) in targetClips.enumerated() {
+                let lane = idx % botCount
+                let hop = idx / botCount
+                let botID = "swarm-\(wave.squad.rawValue)-\(lane)"
+                let delay = Double(waveIdx) * 0.03 + Double(lane) * 0.045 + Double(hop) * 0.14
+                if let r = canvas.magicWindowRect(of: clip, in: project) {
+                    let ov = toOverlay(r)
+                    jobs.append(SwarmJob(botID: botID, squad: wave.squad, action: wave.action,
+                                         target: CGPoint(x: ov.midX, y: ov.midY), highlightRect: ov, delay: delay))
+                }
+                // Also send a companion nano-bot directly onto the Preview Canvas if the clip is visible right now!
+                if wave.showInPreview, let vr = viewerWinRect, clip.kind != .audio,
+                   t >= clip.start - 0.05 && t <= clip.end + 0.05 {
+                    let ovViewer = toOverlay(vr)
+                    let tf = clip.transform ?? ClipTransform()
+                    let px = clip.kind == .text
+                        ? ovViewer.minX + CGFloat(clip.text.x) * ovViewer.width
+                        : ovViewer.midX + CGFloat(tf.x) * ovViewer.width
+                    let py = clip.kind == .text
+                        ? ovViewer.minY + CGFloat(clip.text.y) * ovViewer.height
+                        : ovViewer.midY + CGFloat(tf.y) * ovViewer.height
+                    let boxW = max(56, ovViewer.width * 0.28 * CGFloat(min(1.5, max(0.3, tf.scale))))
+                    let boxH = max(36, ovViewer.height * 0.22 * CGFloat(min(1.5, max(0.3, tf.scale))))
+                    let box = CGRect(x: px - boxW / 2, y: py - boxH / 2, width: boxW, height: boxH).intersection(ovViewer)
+                    jobs.append(SwarmJob(botID: "swarm-\(wave.squad.rawValue)-pv-\(lane)", squad: wave.squad,
+                                         action: wave.action, target: CGPoint(x: px, y: py),
+                                         highlightRect: box.isEmpty ? nil : box, delay: delay + 0.05))
+                }
+            }
+        }
+        AgentPresence.shared.dispatchWave(mission: mission, jobs: jobs, in: window)
+    }
+
+    /// Swarm Mission: Cards + Motion squads isolate & polish all V2+ overlays in parallel.
+    func swarmPolishAllCards() {
+        let v1ID = project.videoTracks.first?.id
+        let overlays = Set(project.clips.filter { $0.trackID != v1ID && ($0.kind == .video || $0.kind == .image) }.map(\.id))
+        let targets = overlays.isEmpty ? Set(project.clips.filter { $0.kind == .image }.map(\.id)) : overlays
+        guard !targets.isEmpty else {
+            showToast("No card overlays on V2+ or images found")
+            return
+        }
+        mutate { p in
+            for i in p.clips.indices where targets.contains(p.clips[i].id) {
+                if p.clips[i].bgRemoval == nil {
+                    p.clips[i].bgRemoval = BackgroundRemoval(mode: .aiCard, tolerance: 0.5, softness: 0.08)
+                }
+                p.clips[i].style = .cardPolish
+                if p.clips[i].animation == nil {
+                    p.clips[i].animation = ClipAnimation(inPreset: .slideDown, inDuration: 0.35, outPreset: .fade, outDuration: 0.25)
+                }
+            }
+        }
+        dispatchVisualSwarm(mission: "Polish Cards Swarm", waves: [
+            (.cards, "Keep Card + Polish", targets, true),
+            (.motion, "Slide Down", targets, true),
+        ])
+        showToast("Swarm polished \(targets.count) card\(targets.count == 1 ? "" : "s")")
+    }
+
+    /// Swarm Mission: Cutter + Audio squads simultaneously trim silences and activate studio Voice Enhance.
+    func swarmAudioAndSilences() {
+        let audioIDs = Set(project.clips.filter { $0.kind == .audio && !project.isLocked($0.trackID) }.map(\.id))
+        guard !audioIDs.isEmpty else {
+            showToast("No audio clips on timeline")
+            return
+        }
+        mutate { p in
+            for i in p.clips.indices where audioIDs.contains(p.clips[i].id) {
+                p.clips[i].voiceEnhance = true
+            }
+        }
+        let cuts = removeSilences(clipIDs: audioIDs)
+        let afterAudio = Set(project.clips.filter { $0.kind == .audio }.map(\.id))
+        dispatchVisualSwarm(mission: "Audio & Silence Swarm", waves: [
+            (.audio, "Voice Enhance", afterAudio, false),
+            (.cutter, cuts > 0 ? "Cut \(cuts) silences" : "Trim clean", afterAudio, false),
+        ])
+        showToast("Voice Enhance ON · \(cuts) silence\(cuts == 1 ? "" : "s") removed")
+    }
+
+    /// Swarm Mission: Color + Motion + Audio squads give the entire edit a broadcast/cinema finish in sync.
+    func swarmCinematicFinish() {
+        let videos = Set(project.clips.filter { ($0.kind == .video || $0.kind == .image) && !project.isLocked($0.trackID) }.map(\.id))
+        let audios = Set(project.clips.filter { $0.kind == .audio && !project.isLocked($0.trackID) }.map(\.id))
+        let overlays = Set(project.clips.filter { $0.trackID != project.videoTracks.first?.id && $0.isTransformable }.map(\.id))
+        guard !videos.isEmpty || !audios.isEmpty else {
+            showToast("Add clips to timeline first")
+            return
+        }
+        mutate { p in
+            for i in p.clips.indices {
+                if videos.contains(p.clips[i].id) {
+                    var g = p.clips[i].grade ?? ColorGrade()
+                    if g.look == nil { g.look = "Film print"; g.lookIntensity = 0.35 }
+                    if abs(g.contrast) < 0.5 { g.contrast = 8 }
+                    p.clips[i].grade = g
+                }
+                if overlays.contains(p.clips[i].id) {
+                    if p.clips[i].style == nil { p.clips[i].style = .cardPolish }
+                    if p.clips[i].animation == nil { p.clips[i].animation = ClipAnimation(inPreset: .pop, inDuration: 0.3, outPreset: .fade, outDuration: 0.25) }
+                }
+                if audios.contains(p.clips[i].id) {
+                    p.clips[i].voiceEnhance = true
+                }
+            }
+        }
+        dispatchVisualSwarm(mission: "Cinematic Finish Swarm", waves: [
+            (.colorist, "Film Print +8", videos, true),
+            (.cards, "Card Polish", overlays, true),
+            (.motion, "Pop Motion", overlays, true),
+            (.audio, "Voice Enhance", audios, false),
+        ])
+        showToast("Swarm finished \(videos.count) video + \(audios.count) audio clips")
     }
 
     // MARK: Files

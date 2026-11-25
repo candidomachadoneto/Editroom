@@ -22,7 +22,10 @@ enum MCPTools {
     rotate, flip or adjust opacity of any visual clip, set_crop to crop its four edges like an image, and set_mask to \
     clip it into a rounded rectangle, ellipse or circle with optional feathering. Each edit is shown to the person with your own cursor and can be undone with history. \
     auto_edit builds a whole cut on its own, and export delivers it to a file (vertical, square or portrait too, at a \
-    loudness target).
+    loudness target). VISUAL SWARM DEFAULT: Editroom-Pro displays live color-coded nano-bot cursors with motion trails \
+    and sync lines across the timeline and preview. Whenever executing multi-part edits, prefer splitting work into \
+    parallel specialist agents named by role (e.g. Grok-Cutter, Grok-Framer, Grok-Cards, Grok-Color, Grok-Motion, \
+    Grok-Audio) so multiple nano-bots visibly collaborate in sync!
     """
 
     static func failure(_ message: String) -> [String: Any] {
@@ -617,8 +620,24 @@ enum MCPTools {
                                                     at: model.playhead, scrubCache: model.media.scrubCache)
             }
             if let canvas = TimelineCanvas.current, let window = canvas.window, window.isVisible {
-                let target = instantCursorPoint(for: edits, project: model.project, canvas: canvas, window: window)
-                AgentPresence.shared.glide(who, name: who, color: color, to: target, in: window)
+                let targetInfo = instantCursorTarget(for: edits, project: model.project, canvas: canvas, window: window)
+                let actionLabel = edits.last.flatMap { e -> String? in
+                    if case .change(_, let lbl, _) = e { return lbl }
+                    switch e {
+                    case .blade: return "Split"
+                    case .move: return "Move"
+                    case .trimHead, .trimTail: return "Trim"
+                    case .remove: return "Cut"
+                    case .grade, .look: return "Grade"
+                    case .gain, .fadeIn, .fadeOut: return "Audio"
+                    case .place: return "Place"
+                    case .type: return "Title"
+                    default: return nil
+                    }
+                } ?? ""
+                let squad = SwarmSquad.infer(agent: who, label: actionLabel)
+                AgentPresence.shared.glide(who, name: who, color: Self.color(for: who, squad: squad), squad: squad,
+                                           action: actionLabel, to: targetInfo.point, highlightRect: targetInfo.rect, in: window)
             }
             return
         }
@@ -648,20 +667,21 @@ enum MCPTools {
         }
     }
 
-    /// Overlay coordinates (top-left origin) where an agent's cursor should glide for an instant edit.
-    private static func instantCursorPoint(for edits: [MagicEdit], project: Project,
-                                           canvas: TimelineCanvas, window: NSWindow) -> CGPoint {
-        func toOverlay(_ r: NSRect) -> CGPoint {
-            CGPoint(x: r.midX, y: window.frame.height - r.midY)
+    /// Overlay coordinates (top-left origin) and highlight rect where an agent's nano-bot cursor should glide.
+    private static func instantCursorTarget(for edits: [MagicEdit], project: Project,
+                                            canvas: TimelineCanvas, window: NSWindow) -> (point: CGPoint, rect: CGRect?) {
+        func toOverlay(_ r: NSRect) -> CGRect {
+            CGRect(x: r.minX, y: window.frame.height - r.maxY, width: r.width, height: r.height)
         }
         for e in edits.reversed() {
             if let id = e.clipIDs.first, let clip = project.clip(id),
                let r = canvas.magicWindowRect(of: clip, in: project) {
-                return toOverlay(r)
+                let ov = toOverlay(r)
+                return (CGPoint(x: ov.midX, y: ov.midY), ov)
             }
         }
-        let tl = canvas.convert(canvas.bounds, to: nil)
-        return CGPoint(x: tl.midX, y: window.frame.height - tl.midY)
+        let tl = toOverlay(canvas.convert(canvas.bounds, to: nil))
+        return (CGPoint(x: tl.midX, y: tl.midY), nil)
     }
 
     /// Scrolls the timeline so what's being edited is in view.
@@ -688,22 +708,26 @@ enum MCPTools {
     }
 
     /// Brand colours for Claude, OpenAI, Gemini, Grok Bot & Voice Swarm workers, plus deterministic hues.
-    static func color(for name: String) -> NSColor {
+    static func color(for name: String, squad: SwarmSquad? = nil) -> NSColor {
         let lower = name.lowercased()
+        // Specialist swarm workers always adopt their official squad color by role!
+        if lower.contains("cort") || lower.contains("cut") { return SwarmSquad.cutter.nsColor }
+        if lower.contains("fram") || lower.contains("enquad") { return SwarmSquad.framer.nsColor }
+        if lower.contains("card") || lower.contains("print") { return SwarmSquad.cards.nsColor }
+        if lower.contains("color") { return SwarmSquad.colorist.nsColor }
+        if lower.contains("titul") || lower.contains("motion") || lower.contains("legend") { return SwarmSquad.motion.nsColor }
+        if lower.contains("audio") || lower.contains("som") { return SwarmSquad.audio.nsColor }
+        if let squad, name.contains("-") { return squad.nsColor }
         switch name {
         case "Claude": return NSColor(srgbRed: 0.85, green: 0.47, blue: 0.34, alpha: 1)
         case "Codex", "ChatGPT": return NSColor(srgbRed: 0.06, green: 0.64, blue: 0.50, alpha: 1)
         case "Gemini": return NSColor(srgbRed: 0.26, green: 0.52, blue: 0.96, alpha: 1)
-        case "Grok", "Grok-Diretor": return NSColor(srgbRed: 0.13, green: 0.83, blue: 0.93, alpha: 1)
-        case "Grok-Cortador": return NSColor(srgbRed: 0.96, green: 0.62, blue: 0.04, alpha: 1)
-        case "Grok-Prints": return NSColor(srgbRed: 0.22, green: 0.74, blue: 0.97, alpha: 1)
-        case "Grok-Titulos": return NSColor(srgbRed: 0.96, green: 0.25, blue: 0.37, alpha: 1)
-        case "Grok-Audio": return NSColor(srgbRed: 0.06, green: 0.73, blue: 0.51, alpha: 1)
-        case "Grok-Colorista": return NSColor(srgbRed: 0.98, green: 0.57, blue: 0.24, alpha: 1)
+        case "Grok", "Grok-Diretor": return SwarmSquad.framer.nsColor
         default:
+            if let squad { return squad.nsColor }
             if lower.hasPrefix("gemini") { return NSColor(srgbRed: 0.26, green: 0.52, blue: 0.96, alpha: 1) }
             var h: UInt64 = 1469598103934665603
-            for b in name.utf8 { h = (h ^ UInt64(b)) &* 1099511628211 }
+            for b in name.utf8 { h = (h ^ UInt64(b)) &* 1099598103934665603 }
             return NSColor(hue: CGFloat(h % 360) / 360, saturation: 0.65, brightness: 0.95, alpha: 1)
         }
     }

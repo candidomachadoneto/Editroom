@@ -101,6 +101,12 @@ struct ContentView: View {
                     .id(themes.look)
             }
             .withoutGlass()
+            ToolbarItem(placement: .primaryAction) {
+                SwarmHUDButton(model: model)
+                    .padding(.trailing, 4)
+                    .id(themes.look)
+            }
+            .withoutGlass()
             if magicEnabled {
                 ToolbarItem(placement: .primaryAction) {
                     MagicButton(model: model)
@@ -139,6 +145,188 @@ struct ContentView: View {
             KeyCommands.install(model)
             AppDelegate.shared?.model = model
         }
+    }
+}
+
+/// Toolbar live Swarm HUD & Command Deck: displays pulsing color-coded squad dots whenever
+/// nano-bots are editing in parallel, and lets the user launch multi-agent swarms in 1 click.
+private struct SwarmHUDButton: View {
+    @ObservedObject var model: EditorModel
+    @ObservedObject private var presence = AgentPresence.shared
+    @AppStorage(AgentPresence.enabledKey) private var swarmVisual = true
+    @State private var open = false
+    @State private var hovering = false
+
+    private var activeSquads: [SwarmSquad] {
+        var seen = Set<SwarmSquad>()
+        return presence.activeBots.compactMap { bot in
+            seen.insert(bot.squad).inserted ? bot.squad : nil
+        }
+    }
+
+    var body: some View {
+        let busy = !presence.activeBots.isEmpty
+        Button {
+            open.toggle()
+        } label: {
+            HStack(spacing: 6) {
+                HStack(spacing: 3) {
+                    let dots = busy ? activeSquads : [.framer, .cards, .cutter, .audio]
+                    ForEach(dots.prefix(5)) { sq in
+                        Circle()
+                            .fill(sq.swiftColor)
+                            .frame(width: busy ? 6.5 : 5.5, height: busy ? 6.5 : 5.5)
+                            .shadow(color: busy ? sq.swiftColor.opacity(0.8) : .clear, radius: 3)
+                    }
+                }
+                Text(busy ? "\(presence.activeBots.count) Bots" : "Swarm")
+                    .font(.system(size: 11.5, weight: .semibold))
+                    .foregroundStyle(busy ? Color.white : (swarmVisual ? Theme.text : Theme.textFaint))
+            }
+            .padding(.horizontal, 10)
+            .frame(height: 27)
+            .background(
+                Capsule().fill(busy ? Color(hex: 0x0F172A) : (hovering || open ? Theme.hover : Theme.field))
+            )
+            .overlay(
+                Capsule().strokeBorder(busy ? Color(hex: 0x38BDF8).opacity(0.8) : Theme.ink.opacity(0.10), lineWidth: 1)
+            )
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering = $0 }
+        .help("Nano-Bot Swarm Command Deck (parallel color-coded agents)")
+        .popover(isPresented: $open, arrowEdge: .bottom) {
+            SwarmCommandDeck(model: model, swarmVisual: $swarmVisual) { open = false }
+        }
+    }
+}
+
+private struct SwarmCommandDeck: View {
+    @ObservedObject var model: EditorModel
+    @ObservedObject private var presence = AgentPresence.shared
+    @Binding var swarmVisual: Bool
+    let close: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Nano-Bot Swarm")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(Theme.text)
+                    Text(presence.missionTitle ?? "Parallel color-coded agents working in sync")
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(presence.missionTitle != nil ? Color(hex: 0x38BDF8) : Theme.textFaint)
+                }
+                Spacer()
+                Toggle("", isOn: $swarmVisual)
+                    .toggleStyle(.switch)
+                    .labelsHidden()
+                    .controlSize(.small)
+                    .tint(Color(hex: 0x38BDF8))
+                    .help("Show visual nano-bot cursors & sync mesh by default")
+            }
+
+            // 6 Official Squads legend (Color + Role + Live status)
+            LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 6) {
+                ForEach(SwarmSquad.allCases) { sq in
+                    let active = presence.activeBots.first { $0.squad == sq }
+                    HStack(spacing: 6) {
+                        Circle()
+                            .fill(sq.swiftColor)
+                            .frame(width: 8, height: 8)
+                            .shadow(color: active != nil ? sq.swiftColor : .clear, radius: 4)
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(sq.label)
+                                .font(.system(size: 11, weight: .semibold))
+                                .foregroundStyle(Theme.text)
+                            Text(active?.action.isEmpty == false ? active!.action : sq.roleDescription)
+                                .font(.system(size: 9.5))
+                                .foregroundStyle(active != nil ? sq.swiftColor : Theme.textFaint)
+                                .lineLimit(1)
+                        }
+                        Spacer(minLength: 0)
+                    }
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 6)
+                    .background(RoundedRectangle(cornerRadius: 7, style: .continuous)
+                        .fill(active != nil ? sq.swiftColor.opacity(0.12) : Theme.field))
+                    .overlay(RoundedRectangle(cornerRadius: 7, style: .continuous)
+                        .strokeBorder(active != nil ? sq.swiftColor.opacity(0.55) : .clear, lineWidth: 1))
+                }
+            }
+
+            Divider().opacity(0.25)
+
+            Text("LAUNCH PARALLEL SWARM")
+                .font(Theme.label())
+                .kerning(1.2)
+                .foregroundStyle(Theme.textFaint)
+
+            VStack(spacing: 6) {
+                missionRow(title: "News Reel 9:16 (Full Swarm)",
+                           detail: "9:16 · Face Track · Keep Card + Polish · Voice Enhance · Cut Silences",
+                           squads: [.framer, .cards, .motion, .audio, .cutter]) {
+                    close()
+                    Task { await model.applyNewsReelMacro() }
+                }
+                missionRow(title: "Polish All Cards & Overlays",
+                           detail: "Isolates V2+ cards, adds shadow/border & Slide Down entrance",
+                           squads: [.cards, .motion]) {
+                    close()
+                    model.swarmPolishAllCards()
+                }
+                missionRow(title: "Cut Silences + Voice Enhance",
+                           detail: "Removes dead air & activates studio vocal chain in sync",
+                           squads: [.cutter, .audio]) {
+                    close()
+                    model.swarmAudioAndSilences()
+                }
+                missionRow(title: "Face Track All Video Clips",
+                           detail: "Neural Engine face detection & auto-reframe across V1",
+                           squads: [.framer]) {
+                    close()
+                    let ids = Set(model.project.clips.filter { $0.kind == .video || $0.kind == .image }.map(\.id))
+                    Task { await model.autoReframeFaces(clipIDs: ids) }
+                }
+                missionRow(title: "Cinematic Finish",
+                           detail: "Film Print grade · Card Polish · Pop motion · Voice Enhance",
+                           squads: [.colorist, .cards, .motion, .audio]) {
+                    close()
+                    model.swarmCinematicFinish()
+                }
+            }
+        }
+        .padding(14)
+        .frame(width: 368)
+        .background(Theme.panel)
+    }
+
+    private func missionRow(title: String, detail: String, squads: [SwarmSquad], action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack(spacing: 8) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(title)
+                        .font(.system(size: 11.5, weight: .semibold))
+                        .foregroundStyle(Theme.text)
+                    Text(detail)
+                        .font(.system(size: 10))
+                        .foregroundStyle(Theme.textFaint)
+                        .lineLimit(1)
+                }
+                Spacer(minLength: 6)
+                HStack(spacing: 3) {
+                    ForEach(squads) { sq in
+                        Circle().fill(sq.swiftColor).frame(width: 6, height: 6)
+                    }
+                }
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 7)
+            .background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(Theme.field))
+            .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).strokeBorder(Theme.ink.opacity(0.06)))
+        }
+        .buttonStyle(.plain)
     }
 }
 

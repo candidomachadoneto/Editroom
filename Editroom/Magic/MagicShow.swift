@@ -678,9 +678,10 @@ final class MagicShow: NSObject {
         few = tasks.count <= 6
         let count = agentMode ? 1 : min(64, max(14, Int(Double(tasks.count) / 2.4)))
         var rng = SeededRandom(seed: UInt64(tasks.count))
+        let squads = SwarmSquad.allCases
         for i in 0..<count {
-            let hue = (Double(i) * 0.61803398875).truncatingRemainder(dividingBy: 1)
-            let a = Agent(color: performer?.color ?? NSColor(hue: hue, saturation: 0.68, brightness: 0.97, alpha: 1))
+            let squadColor = squads[i % squads.count].nsColor
+            let a = Agent(color: performer?.color ?? squadColor)
             // Out of the button one after another, slowly at first, then faster.
             // Out of the button one after another: slowly at first, then faster, never quite evenly.
             a.birth = max(0, 2.4 * pow(Double(i) / Double(count), 0.7) + (rng.next() - 0.5) * 0.12)

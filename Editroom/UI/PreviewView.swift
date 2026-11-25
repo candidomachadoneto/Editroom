@@ -1189,6 +1189,7 @@ private struct MultiCanvasQuickBar: View {
             }
         }
         AppleHaptics.align()
+        model.dispatchVisualSwarm(mission: "Align Layers", waves: [(.framer, "Align", ids, true)])
     }
 
     var body: some View {
@@ -1217,6 +1218,7 @@ private struct MultiCanvasQuickBar: View {
                             p.clips[i].style = allPolished ? nil : .cardPolish
                         }
                     }
+                    model.dispatchVisualSwarm(mission: "Batch Card Polish", waves: [(.cards, allPolished ? "Clear Polish" : "Card Polish", transformableIDs, true)])
                     AppleHaptics.click()
                 }
             }
@@ -1228,6 +1230,7 @@ private struct MultiCanvasQuickBar: View {
                             p.clips[i].bgRemoval = allCard ? nil : BackgroundRemoval(mode: .aiCard, tolerance: 0.5, softness: 0.04)
                         }
                     }
+                    model.dispatchVisualSwarm(mission: "Batch Keep Card", waves: [(.cards, allCard ? "Restore BG" : "Keep Card", cuttableIDs, true)])
                     AppleHaptics.click()
                 }
             }
