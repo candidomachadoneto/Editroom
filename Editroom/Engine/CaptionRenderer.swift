@@ -73,7 +73,7 @@ enum CaptionRenderer {
         return drawn.transformed(by: CGAffineTransform(translationX: ((output.width - e.width) / 2).rounded(), y: y.rounded()))
     }
 
-    /// Heavy words in the text colour, with an outline if it has one, the lit one in the highlight colour.
+    /// Heavy words in the text colour, with optional pill background box, drop shadow, and outline.
     private static func draw(words: [String], lit: Int?, style: CaptionStyle, output: CGSize) -> CIImage? {
         let pt = CGFloat(style.size) * min(output.width, output.height) / 1080
         let ns = { (c: RGBA) in NSColor(srgbRed: c.r, green: c.g, blue: c.b, alpha: c.a) }
@@ -81,14 +81,21 @@ enum CaptionRenderer {
         let para = NSMutableParagraphStyle()
         para.alignment = .center
         para.lineBreakMode = .byWordWrapping
+        let shownWords = style.uppercase ? words.map { $0.uppercased() } : words
         func text(fill: Bool) -> NSAttributedString {
             let s = NSMutableAttributedString()
-            for (i, w) in words.enumerated() {
-                // A little wider than a plain space: the outline eats into the gap.
+            for (i, w) in shownWords.enumerated() {
                 if i > 0 { s.append(NSAttributedString(string: " ", attributes: [.font: font, .kern: pt * 0.06])) }
                 var attrs: [NSAttributedString.Key: Any] = [.font: font, .paragraphStyle: para]
                 if fill {
                     attrs[.foregroundColor] = ns(i == lit ? style.highlightColor : style.textColor)
+                    if style.shadow {
+                        let sh = NSShadow()
+                        sh.shadowColor = NSColor.black.withAlphaComponent(0.75)
+                        sh.shadowBlurRadius = max(3, pt * 0.14)
+                        sh.shadowOffset = CGSize(width: 0, height: -max(2, pt * 0.06))
+                        attrs[.shadow] = sh
+                    }
                 } else {
                     attrs[.foregroundColor] = ns(style.outlineColor)
                     attrs[.strokeColor] = ns(style.outlineColor)
@@ -102,19 +109,27 @@ enum CaptionRenderer {
         let fill = text(fill: true), outline = text(fill: false)
         let opts: NSString.DrawingOptions = [.usesLineFragmentOrigin, .usesFontLeading]
         let bounds = fill.boundingRect(with: CGSize(width: output.width * 0.86, height: .greatestFiniteMagnitude), options: opts)
-        let pad = ceil(pt * 0.3)
+        let padX = ceil(pt * (style.boxColor != nil ? 0.45 : 0.3))
+        let padY = ceil(pt * (style.boxColor != nil ? 0.28 : 0.3))
         let tw = ceil(bounds.width), th = ceil(bounds.height)
-        let w = Int(tw + pad * 2), h = Int(th + pad * 2)
+        let w = Int(tw + padX * 2), h = Int(th + padY * 2)
         guard w > 0, h > 0, w < 16384, h < 16384,
               let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0,
                                   space: CGColorSpace(name: CGColorSpace.sRGB)!,
                                   bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue)
         else { return nil }
         ctx.setLineJoin(.round)
+        if let box = style.boxColor {
+            let boxRect = CGRect(x: 2, y: 2, width: CGFloat(w) - 4, height: CGFloat(h) - 4)
+            let cr = min(boxRect.height * 0.28, pt * 0.35)
+            ctx.addPath(CGPath(roundedRect: boxRect, cornerWidth: cr, cornerHeight: cr, transform: nil))
+            ctx.setFillColor(ns(box).cgColor)
+            ctx.fillPath()
+        }
         let g = NSGraphicsContext(cgContext: ctx, flipped: false)
         NSGraphicsContext.saveGraphicsState()
         NSGraphicsContext.current = g
-        let r = CGRect(x: pad, y: pad, width: tw, height: th)
+        let r = CGRect(x: padX, y: padY, width: tw, height: th)
         if style.outline { outline.draw(with: r, options: opts) }
         fill.draw(with: r, options: opts)
         NSGraphicsContext.restoreGraphicsState()

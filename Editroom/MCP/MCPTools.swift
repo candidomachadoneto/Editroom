@@ -89,6 +89,10 @@ enum MCPTools {
                   "size": num("Text size, 28...140 (default 64)."),
                   "position": num("Where they sit, 0.1 (top) to 0.95 (bottom) of the frame (default 0.78)."),
                   "highlight": ["type": "boolean", "description": "Light up each word as it's said (default true)."],
+                  "preset": ["type": "string", "enum": CaptionPreset.allCases.map(\.rawValue), "description": "Style preset: classic, tiktokPop, yellowBox, editorial, cinema."],
+                  "uppercase": ["type": "boolean", "description": "Render captions in ALL CAPS."],
+                  "box_color": str("Optional rounded pill background hex colour (or \"none\" to clear)."),
+                  "shadow": ["type": "boolean", "description": "Drop shadow behind captions (default true)."],
                   "hidden": ["type": "boolean", "description": "Hide or show the caption track (hidden captions aren't exported)."],
                   "edit": ["type": "array", "description": "Captions to change, each found by a timeline time inside it (as set_captions or get_project return them): the words it should say, or \"\" to take it out. The caption keeps its time.",
                            "items": ["type": "object", "properties": ["at": ["type": "number", "description": "Timeline seconds inside the caption."],
@@ -373,11 +377,26 @@ enum MCPTools {
             let size = number("size").map { $0.clamped(to: CaptionStyle.sizeRange) }
             let position = number("position").map { $0.clamped(to: 0.1...0.95) }
             let highlight = args["highlight"] as? Bool, hidden = args["hidden"] as? Bool
+            let preset = try (args["preset"] as? String).map { raw -> CaptionPreset in
+                guard let pr = CaptionPreset(rawValue: raw) else {
+                    throw MCPToolError("preset is " + CaptionPreset.allCases.map(\.rawValue).joined(separator: ", ") + ".")
+                }
+                return pr
+            }
+            let uppercase = args["uppercase"] as? Bool
+            let shadow = args["shadow"] as? Bool
+            let clearBox = (args["box_color"] as? String)?.lowercased() == "none"
+            let boxColor = clearBox ? nil : try colorArg(args["box_color"]).map { RGBA(r: $0.r, g: $0.g, b: $0.b, a: 0.82) }
             try await perform([.change(targets.first, "Captions") { proj in
                 proj.addCaptions(targets)
+                if let preset { proj.captions?.style.apply(preset: preset) }
                 if let size { proj.captions?.style.size = size }
                 if let position { proj.captions?.style.y = position }
                 if let highlight { proj.captions?.style.highlight = highlight }
+                if let uppercase { proj.captions?.style.uppercase = uppercase }
+                if let shadow { proj.captions?.style.shadow = shadow }
+                if clearBox { proj.captions?.style.boxColor = nil }
+                else if let boxColor { proj.captions?.style.boxColor = boxColor }
                 if let hidden { proj.captions?.hidden = hidden }
                 for (b, text) in fixes { proj.setCaptionText(b, to: text) }
             }], model, who, draft)
@@ -616,7 +635,10 @@ enum MCPTools {
     /// True when every edit only mutates visual appearance (transform/crop/mask/grade/title/solid)
     /// without altering clip timing, speed, source range, or track structure.
     private static func isVisualOnly(_ edits: [MagicEdit]) -> Bool {
-        let visualLabels: Set<String> = ["Transform", "Crop", "Mask", "Background Removal", "Title style", "Colour"]
+        let visualLabels: Set<String> = [
+            "Transform", "Crop", "Mask", "Background Removal", "Title style", "Colour",
+            "Clip Style", "Animation", "Keyframes", "Clear Keyframes", "Highlighter", "Privacy Blur", "Lower Third",
+        ]
         return edits.allSatisfy { e in
             switch e {
             case .grade, .look, .type: return true
@@ -837,10 +859,27 @@ enum MCPTools {
                 "softness": round3(bg.softness),
             ]
             if abs(bg.edgeShift) > 1e-4 { bd["edge_shift"] = round3(bg.edgeShift) }
+            if bg.blurBackground > 1e-4 { bd["blur_background"] = round3(bg.blurBackground) }
             if bg.invert { bd["invert"] = true }
             if bg.mode == .chromaKey { bd["key_color"] = hex(bg.keyColor) }
             d["background_removal"] = bd
         }
+        if let st = c.style, !st.isIdentity {
+            d["clip_style"] = [
+                "shadow_opacity": round3(st.shadowOpacity),
+                "shadow_radius": round3(st.shadowRadius),
+                "border_width": round3(st.borderWidth),
+                "corner_radius": round3(st.cornerRadius),
+            ]
+        }
+        if let anim = c.animation, !anim.isIdentity {
+            d["animation"] = ["in": anim.inPreset.rawValue, "out": anim.outPreset.rawValue, "loop": anim.loopPreset.rawValue]
+        }
+        if let kfs = c.keyframes, !kfs.isEmpty { d["keyframes_count"] = kfs.count }
+        if let hl = c.highlight { d["highlight"] = ["x": round3(hl.x), "y": round3(hl.y), "width": round3(hl.width), "height": round3(hl.height)] }
+        if let pb = c.privacyBlur { d["privacy_blur"] = ["x": round3(pb.x), "y": round3(pb.y), "width": round3(pb.width), "height": round3(pb.height), "pixelate": pb.pixelate] }
+        if let lt = c.lowerThird { d["lower_third"] = ["title": lt.title, "subtitle": lt.subtitle, "y": round3(lt.y)] }
+        if c.voiceEnhance == true { d["voice_enhance"] = true }
         if let g = c.grade {
             var gd: [String: Any] = [:]
             if let look = g.look { gd["look"] = g.lookLabel; if look != g.lookLabel { gd["look_file"] = look } }
@@ -962,9 +1001,63 @@ extension MCPTools {
                   "tolerance": num("Cutout tolerance 0...1 (0 = strict, 0.5 = balanced, 1 = keep more foreground)."),
                   "softness": num("Edge feather softness 0...1 (default 0.15)."),
                   "edge_shift": num("Shrink (<0, removes edge halo) or expand (>0) matte, -1...1 (default 0)."),
+                  "blur_background": num("Portrait background blur 0...1 (0 = transparent cutout, >0 = blurred DSLR lens background)."),
                   "invert": ["type": "boolean", "description": "Invert foreground and background."],
                   "key_color": str("Hex colour for chromaKey mode, like #00B140.")],
                  required: ["clip_id"]),
+            tool("set_clip_style", "Card Polish & Clip Style", "Adds drop shadow (works on AI cutouts too), border outline, and rounded corners to any visual clip, or applies the 1-click cardPolish preset.",
+                 ["clip_id": str("A visual clip's id."),
+                  "preset": ["type": "string", "enum": ["cardPolish", "none"], "description": "1-click Card Polish preset or none."],
+                  "shadow_opacity": num("0...1."), "shadow_radius": num("0...80."), "shadow_offset_y": num("-60...60."),
+                  "border_width": num("0...40."), "border_color": str("Hex colour like #FFFFFF."),
+                  "corner_radius": num("0...0.5."), "reset": ["type": "boolean"]],
+                 required: ["clip_id"]),
+            tool("set_animation", "Clip Motion Animation", "CapCut-style entry, exit and loop animations (fade, pop, slideUp, slideDown, slideLeft, slideRight, zoomIn, zoomOut, kenBurns, float).",
+                 ["clip_id": str("A visual clip's id."),
+                  "in": ["type": "string", "enum": MotionPreset.inOutCases.map(\.rawValue)],
+                  "out": ["type": "string", "enum": MotionPreset.inOutCases.map(\.rawValue)],
+                  "loop": ["type": "string", "enum": MotionPreset.loopCases.map(\.rawValue)],
+                  "in_duration": num("0.05...3."), "out_duration": num("0.05...3."),
+                  "reset": ["type": "boolean"]],
+                 required: ["clip_id"]),
+            tool("set_keyframes", "Clip Keyframes", "Sets smoothstep-interpolated transform keyframes (x, y, scale, rotation, opacity) at local clip times, or clears them.",
+                 ["clip_id": str("A visual clip's id."),
+                  "keyframes": ["type": "array", "items": ["type": "object", "properties": [
+                      "time": num("Seconds from clip start."),
+                      "x": num("X offset."), "y": num("Y offset."),
+                      "scale": num("Scale."), "rotation": num("Degrees."), "opacity": num("0...1.")
+                  ], "required": ["time"]]],
+                  "clear": ["type": "boolean"]],
+                 required: ["clip_id"]),
+            tool("set_highlighter", "Animated Headline Highlighter", "Animated translucent marker bar that wipes left-to-right across a news card headline.",
+                 ["clip_id": str("A visual clip's id."), "enabled": ["type": "boolean"],
+                  "x": num("Center X 0...1."), "y": num("Center Y 0...1."), "width": num("0.05...1."), "height": num("0.02...0.4."),
+                  "start_offset": num("Delay in seconds from clip start."), "wipe_duration": num("Wipe speed in seconds."),
+                  "color": str("Hex colour like #FDE047.")],
+                 required: ["clip_id"]),
+            tool("set_privacy_blur", "Privacy Blur / Pixelate", "Blurs or pixelates a normalized region inside a video or image clip to censor faces, plates or sensitive info.",
+                 ["clip_id": str("A visual clip's id."), "enabled": ["type": "boolean"],
+                  "x": num("Center X 0...1."), "y": num("Center Y 0...1."), "width": num("0.05...1."), "height": num("0.05...1."),
+                  "strength": num("0.1...1."), "pixelate": ["type": "boolean", "description": "Mosaic pixelation instead of Gaussian blur."]],
+                 required: ["clip_id"]),
+            tool("set_lower_third", "Broadcast Lower Third", "Animated broadcast name/headline lower-third bar rendered crisply over a clip.",
+                 ["clip_id": str("A visual clip's id."), "enabled": ["type": "boolean"],
+                  "title": str("Main title text."), "subtitle": str("Optional subtitle line."),
+                  "accent_color": str("Left accent bar hex colour like #F5C542."), "y": num("Vertical position 0.1...0.95.")],
+                 required: ["clip_id"]),
+            tool("auto_reframe_face", "AI Face Auto-Reframe", "Runs Apple Neural Engine face detection across a clip and automatically scales & centers/keyframes the speaker's face for the sequence aspect ratio (9:16, 1:1, etc.).",
+                 ["clip_id": str("Single clip id."), "clip_ids": ["type": "array", "items": ["type": "string"], "description": "Multiple clip ids."]]),
+            tool("remove_silences", "Remove Silences", "Automatically detects dead air below threshold_db and ripple-cuts pauses across audio + linked video clips in 1 undo step.",
+                 ["clip_ids": ["type": "array", "items": ["type": "string"], "description": "Optional target clip ids (empty = all unlocked audio clips)."],
+                  "threshold_db": num("Silence threshold in dB (default -34)."),
+                  "min_silence": num("Minimum silence length in seconds (default 0.45)."),
+                  "padding": num("Keep this many seconds of breath around cuts (default 0.08).")]),
+            tool("set_voice_enhance", "Voice Enhance", "Turns real-time studio vocal enhancement (85Hz HPF + presence EQ + broadcast compressor/limiter) on or off for audio clips.",
+                 ["clip_id": str("Single audio clip id."), "clip_ids": ["type": "array", "items": ["type": "string"]], "enabled": ["type": "boolean"]],
+                 required: ["enabled"]),
+            tool("snapshot_frame", "Export Frame PNG", "Renders the exact current composited frame at full sequence resolution and saves it as a PNG file (default: Desktop).",
+                 ["path": str("Optional absolute PNG destination path.")]),
+            tool("apply_news_reel_macro", "Apply News Reel 9:16 Macro", "1-click macro: switches to 1080×1920 vertical, face-tracks V1, isolates & polishes V2+ news cards, enhances A1 dialogue, and cuts silences."),
             tool("set_title_style", "Title style", "A title's words and look. Leave out what shouldn't change.",
                  ["clip_id": str("A title clip's id."), "text": str("The words."), "font": str("A font family installed on this Mac, or \"System\"."),
                   "size": num("Points, for a 1080-pixel-tall frame (12...600; default 110)."), "bold": ["type": "boolean"],
@@ -1307,6 +1400,7 @@ extension MCPTools {
             let tolerance = double(args["tolerance"])
             let softness = double(args["softness"])
             let edgeShift = double(args["edge_shift"])
+            let blurBG = double(args["blur_background"])
             let invert = args["invert"] as? Bool
             let keyColor = try colorArg(args["key_color"])
             try await perform([.change(c.id, "Background Removal") { q in
@@ -1320,12 +1414,190 @@ extension MCPTools {
                 if let tolerance { b.tolerance = tolerance }
                 if let softness { b.softness = softness }
                 if let edgeShift { b.edgeShift = edgeShift }
+                if let blurBG { b.blurBackground = blurBG }
                 if let invert { b.invert = invert }
                 if let keyColor { b.keyColor = keyColor }
                 b.clampAll()
                 q.clips[i].bgRemoval = b
             }], model, who, draft)
             return json(clipsJSON([c.id], now()))
+
+        case "set_clip_style":
+            let c = try clipArg(args, p)
+            guard c.isTransformable else { throw MCPToolError("Only video, image and solid clips support clip styles.") }
+            let preset = args["preset"] as? String
+            let reset = args["reset"] as? Bool == true || preset == "none"
+            let shadowOp = double(args["shadow_opacity"]), shadowRad = double(args["shadow_radius"]), shadowY = double(args["shadow_offset_y"])
+            let borderW = double(args["border_width"]), cornerR = double(args["corner_radius"])
+            let borderCol = try colorArg(args["border_color"])
+            try await perform([.change(c.id, "Clip Style") { q in
+                guard let i = q.index(of: c.id) else { return }
+                if reset { q.clips[i].style = nil; return }
+                var st = preset == "cardPolish" ? ClipStyle.cardPolish : (q.clips[i].style ?? ClipStyle())
+                if let shadowOp { st.shadowOpacity = shadowOp }
+                if let shadowRad { st.shadowRadius = shadowRad }
+                if let shadowY { st.shadowOffsetY = shadowY }
+                if let borderW { st.borderWidth = borderW }
+                if let borderCol { st.borderColor = borderCol }
+                if let cornerR { st.cornerRadius = cornerR }
+                st.clampAll()
+                q.clips[i].style = st.isIdentity ? nil : st
+            }], model, who, draft)
+            return json(clipsJSON([c.id], now()))
+
+        case "set_animation":
+            let c = try clipArg(args, p)
+            guard c.isTransformable else { throw MCPToolError("Only video, image and solid clips support animations.") }
+            let reset = args["reset"] as? Bool == true
+            let inP = try (args["in"] as? String).map { r -> MotionPreset in
+                guard let m = MotionPreset(rawValue: r) else { throw MCPToolError("Unknown in animation \(r).") }; return m
+            }
+            let outP = try (args["out"] as? String).map { r -> MotionPreset in
+                guard let m = MotionPreset(rawValue: r) else { throw MCPToolError("Unknown out animation \(r).") }; return m
+            }
+            let loopP = try (args["loop"] as? String).map { r -> MotionPreset in
+                guard let m = MotionPreset(rawValue: r) else { throw MCPToolError("Unknown loop animation \(r).") }; return m
+            }
+            let inDur = double(args["in_duration"]), outDur = double(args["out_duration"])
+            try await perform([.change(c.id, "Animation") { q in
+                guard let i = q.index(of: c.id) else { return }
+                if reset { q.clips[i].animation = nil; return }
+                var a = q.clips[i].animation ?? ClipAnimation()
+                if let inP { a.inPreset = inP }
+                if let outP { a.outPreset = outP }
+                if let loopP { a.loopPreset = loopP }
+                if let inDur { a.inDuration = inDur.clamped(to: 0.05...3) }
+                if let outDur { a.outDuration = outDur.clamped(to: 0.05...3) }
+                q.clips[i].animation = a.isIdentity ? nil : a
+            }], model, who, draft)
+            return json(clipsJSON([c.id], now()))
+
+        case "set_keyframes":
+            let c = try clipArg(args, p)
+            guard c.isTransformable else { throw MCPToolError("Only video, image and solid clips support keyframes.") }
+            if args["clear"] as? Bool == true {
+                try await perform([.change(c.id, "Clear Keyframes") { q in if let i = q.index(of: c.id) { q.clips[i].keyframes = nil } }], model, who, draft)
+                return json(clipsJSON([c.id], now()))
+            }
+            let raw = args["keyframes"] as? [[String: Any]] ?? []
+            guard !raw.isEmpty else { throw MCPToolError("Give keyframes array or clear: true.") }
+            let base = c.transform ?? ClipTransform()
+            var keys: [ClipKeyframe] = []
+            for item in raw {
+                guard let t = double(item["time"]) else { throw MCPToolError("Each keyframe needs time (seconds from clip start).") }
+                keys.append(ClipKeyframe(
+                    time: max(0, t),
+                    x: double(item["x"]) ?? base.x,
+                    y: double(item["y"]) ?? base.y,
+                    scale: (double(item["scale"]) ?? base.scale).clamped(to: ClipTransform.scaleRange),
+                    rotation: double(item["rotation"]) ?? base.rotation,
+                    opacity: (double(item["opacity"]) ?? base.opacity).clamped(to: 0...1)
+                ))
+            }
+            keys.sort { $0.time < $1.time }
+            try await perform([.change(c.id, "Keyframes") { q in if let i = q.index(of: c.id) { q.clips[i].keyframes = keys } }], model, who, draft)
+            return json(clipsJSON([c.id], now()))
+
+        case "set_highlighter":
+            let c = try clipArg(args, p)
+            guard c.isTransformable else { throw MCPToolError("Only video, image and solid clips support highlighter.") }
+            let enabled = args["enabled"] as? Bool
+            let x = double(args["x"]), y = double(args["y"]), w = double(args["width"]), h = double(args["height"])
+            let offset = double(args["start_offset"]), wipe = double(args["wipe_duration"])
+            let col = try colorArg(args["color"]).map { RGBA(r: $0.r, g: $0.g, b: $0.b, a: 0.48) }
+            try await perform([.change(c.id, "Highlighter") { q in
+                guard let i = q.index(of: c.id) else { return }
+                if enabled == false { q.clips[i].highlight = nil; return }
+                var hl = q.clips[i].highlight ?? ClipHighlight()
+                if let x { hl.x = x }; if let y { hl.y = y }; if let w { hl.width = w }; if let h { hl.height = h }
+                if let offset { hl.startOffset = offset }; if let wipe { hl.wipeDuration = wipe }
+                if let col { hl.color = col }
+                hl.clampAll()
+                q.clips[i].highlight = hl
+            }], model, who, draft)
+            return json(clipsJSON([c.id], now()))
+
+        case "set_privacy_blur":
+            let c = try clipArg(args, p)
+            guard c.isTransformable else { throw MCPToolError("Only video, image and solid clips support privacy blur.") }
+            let enabled = args["enabled"] as? Bool
+            let x = double(args["x"]), y = double(args["y"]), w = double(args["width"]), h = double(args["height"])
+            let strength = double(args["strength"]), pix = args["pixelate"] as? Bool
+            try await perform([.change(c.id, "Privacy Blur") { q in
+                guard let i = q.index(of: c.id) else { return }
+                if enabled == false { q.clips[i].privacyBlur = nil; return }
+                var pb = q.clips[i].privacyBlur ?? PrivacyBlur()
+                if let x { pb.x = x }; if let y { pb.y = y }; if let w { pb.width = w }; if let h { pb.height = h }
+                if let strength { pb.strength = strength }; if let pix { pb.pixelate = pix }
+                pb.clampAll()
+                q.clips[i].privacyBlur = pb
+            }], model, who, draft)
+            return json(clipsJSON([c.id], now()))
+
+        case "set_lower_third":
+            let c = try clipArg(args, p)
+            guard c.isTransformable else { throw MCPToolError("Only video, image and solid clips support lower thirds.") }
+            let enabled = args["enabled"] as? Bool
+            let title = args["title"] as? String
+            let subtitle = args["subtitle"] as? String
+            let y = double(args["y"])
+            let accent = try colorArg(args["accent_color"])
+            try await perform([.change(c.id, "Lower Third") { q in
+                guard let i = q.index(of: c.id) else { return }
+                if enabled == false { q.clips[i].lowerThird = nil; return }
+                var lt = q.clips[i].lowerThird ?? LowerThird()
+                if let title { lt.title = title }
+                if let subtitle { lt.subtitle = subtitle }
+                if let y { lt.y = y.clamped(to: 0.1...0.95) }
+                if let accent { lt.accentColor = accent }
+                q.clips[i].lowerThird = lt
+            }], model, who, draft)
+            return json(clipsJSON([c.id], now()))
+
+        case "auto_reframe_face":
+            if draft != nil { throw MCPToolError("auto_reframe_face runs directly on the live timeline.") }
+            let rawIDs = (args["clip_ids"] as? [String]) ?? (args["clip_id"] as? String).map { [$0] } ?? []
+            let ids: Set<UUID> = rawIDs.isEmpty
+                ? Set(p.clips.filter { $0.kind == .video || $0.kind == .image }.map(\.id))
+                : Set(rawIDs.compactMap(UUID.init(uuidString:)))
+            let count = await model.autoReframeFaces(clipIDs: ids)
+            return json(["reframed": count, "clips": clipsJSON(Array(ids), model.project)])
+
+        case "remove_silences":
+            if draft != nil { throw MCPToolError("remove_silences runs directly on the live timeline.") }
+            let rawIDs = (args["clip_ids"] as? [String]) ?? []
+            let ids = Set(rawIDs.compactMap(UUID.init(uuidString:)))
+            let thresh = double(args["threshold_db"]) ?? -34
+            let minS = double(args["min_silence"]) ?? 0.45
+            let pad = double(args["padding"]) ?? 0.08
+            let count = model.removeSilences(clipIDs: ids, thresholdDB: thresh, minSilence: minS, padding: pad)
+            return json(["silences_removed": count, "duration": round3(model.project.duration)])
+
+        case "set_voice_enhance":
+            let rawIDs = (args["clip_ids"] as? [String]) ?? (args["clip_id"] as? String).map { [$0] } ?? []
+            guard let enabled = args["enabled"] as? Bool else { throw MCPToolError("enabled (true/false) is required.") }
+            let ids: Set<UUID> = rawIDs.isEmpty
+                ? Set(p.clips.filter { $0.kind == .audio }.map(\.id))
+                : Set(rawIDs.compactMap(UUID.init(uuidString:)))
+            try await perform([.change(ids.first, "Voice Enhance") { q in
+                for i in q.clips.indices where ids.contains(q.clips[i].id) && q.clips[i].kind == .audio {
+                    q.clips[i].voiceEnhance = enabled ? true : nil
+                }
+            }], model, who, draft)
+            return json(clipsJSON(Array(ids), now()))
+
+        case "snapshot_frame":
+            if draft != nil { throw MCPToolError("snapshot_frame runs on the live timeline.") }
+            let customURL = (args["path"] as? String).map { URL(fileURLWithPath: ($0 as NSString).expandingTildeInPath) }
+            guard let saved = await model.snapshotCurrentFrame(to: customURL) else {
+                throw MCPToolError("Could not capture current frame.")
+            }
+            return json(["file": saved.path, "width": model.project.width, "height": model.project.height])
+
+        case "apply_news_reel_macro":
+            if draft != nil { throw MCPToolError("apply_news_reel_macro runs directly on the live timeline.") }
+            let summary = await model.applyNewsReelMacro()
+            return text(summary)
 
         case "set_title_style":
             let c = try clipArg(args, p)

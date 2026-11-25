@@ -1,3 +1,4 @@
+import AppKit
 import AVFoundation
 import CoreGraphics
 import CoreImage
@@ -200,9 +201,17 @@ final class BackgroundMatteEngine: @unchecked Sendable {
             matte = matte.applyingFilter("CIColorInvert").cropped(to: extent)
         }
 
-        let clear = CIImage(color: .clear).cropped(to: extent)
+        let bgImg: CIImage
+        if bg.blurBackground > 0.01 {
+            let blurR = CGFloat(bg.blurBackground.clamped(to: 0...1) * 28.0)
+            bgImg = image.clampedToExtent()
+                .applyingFilter("CIGaussianBlur", parameters: [kCIInputRadiusKey: blurR])
+                .cropped(to: extent)
+        } else {
+            bgImg = CIImage(color: .clear).cropped(to: extent)
+        }
         return image.applyingFilter("CIBlendWithMask", parameters: [
-            kCIInputBackgroundImageKey: clear,
+            kCIInputBackgroundImageKey: bgImg,
             kCIInputMaskImageKey: matte,
         ]).cropped(to: extent)
     }
@@ -296,9 +305,17 @@ final class BackgroundMatteEngine: @unchecked Sendable {
             matte = matte.applyingFilter("CIColorInvert").cropped(to: extent)
         }
 
-        let clear = CIImage(color: .clear).cropped(to: extent)
+        let bgImg: CIImage
+        if bg.blurBackground > 0.01 {
+            let blurR = CGFloat(bg.blurBackground.clamped(to: 0...1) * 28.0)
+            bgImg = image.clampedToExtent()
+                .applyingFilter("CIGaussianBlur", parameters: [kCIInputRadiusKey: blurR])
+                .cropped(to: extent)
+        } else {
+            bgImg = CIImage(color: .clear).cropped(to: extent)
+        }
         return image.applyingFilter("CIBlendWithMask", parameters: [
-            kCIInputBackgroundImageKey: clear,
+            kCIInputBackgroundImageKey: bgImg,
             kCIInputMaskImageKey: matte,
         ]).cropped(to: extent)
     }
@@ -478,6 +495,12 @@ struct RenderLayer {
     let color: SourceColor
     let transform: ClipTransform?
     let bgRemoval: BackgroundRemoval?
+    let style: ClipStyle?
+    let animation: ClipAnimation?
+    let keyframes: [ClipKeyframe]?
+    let highlight: ClipHighlight?
+    let privacyBlur: PrivacyBlur?
+    let lowerThird: LowerThird?
     /// A video layer's place in its file, for scrubbing from made-ahead frames (nil: not from them).
     let scrub: ScrubSource?
 
@@ -489,6 +512,12 @@ struct RenderLayer {
         self.color = color
         transform = clip.transform.flatMap { $0.isIdentity ? nil : $0 }
         bgRemoval = clip.bgRemoval
+        style = clip.style.flatMap { $0.isDefault ? nil : $0 }
+        animation = clip.animation.flatMap { $0.isDefault ? nil : $0 }
+        keyframes = clip.keyframes.flatMap { $0.isEmpty ? nil : $0 }
+        highlight = clip.highlight
+        privacyBlur = clip.privacyBlur
+        lowerThird = clip.lowerThird
         start = clip.start - plan.leadIn
         end = clip.end + plan.tailOut
         fadeStart = clip.start
@@ -757,24 +786,54 @@ final class TimelineCompositor: NSObject, AVVideoCompositing {
             if let tf, tf.hasCrop {
                 image = image.cropped(to: cropRect)
             }
-            // 3. AI Background Removal / Chroma Key (runs after crop so Vision focuses on the kept region).
+            // 3. AI Background Removal / Portrait Blur / Card Cutout / Chroma Key.
             if let bg = layer.bgRemoval {
                 image = BackgroundMatteEngine.apply(bg, to: image, clipID: layer.clipID, at: t, isStill: isStill)
             }
-            if let tf {
-                // 4. Geometric Mask (rounded corners / ellipse / circle + feather) inside cropped rect.
-                if tf.hasMask, let mask = makeMask(rect: cropRect, shape: tf.maskShape,
-                                                   cornerRadius: tf.cornerRadius, feather: tf.maskFeather) {
-                    let clear = CIImage(color: .clear).cropped(to: cropRect)
-                    image = image.applyingFilter("CIBlendWithMask", parameters: [
-                        kCIInputBackgroundImageKey: clear,
-                        kCIInputMaskImageKey: mask,
-                    ]).cropped(to: cropRect)
-                }
-                // 5. Scale, rotate and offset using the shared transform matrix (Preview == Export == HitTest).
-                if abs(tf.scale - 1) > 1e-6 || abs(tf.rotation) > 1e-6 || abs(tf.x) > 1e-6 || abs(tf.y) > 1e-6 {
-                    image = image.transformed(by: tf.affine(canvasSize: size, yUp: true))
-                }
+            // 3b. Privacy Blur / Pixelate Censorship Zone inside cropped rect.
+            if let pb = layer.privacyBlur {
+                image = applyPrivacyBlur(pb, to: image, in: cropRect)
+            }
+            // 3c. Animated News Headline Highlighter (wipes smoothly left-to-right).
+            let localT = max(0, t - layer.fadeStart)
+            let clipDur = max(0.05, layer.fadeEnd - layer.fadeStart)
+            if let hl = layer.highlight {
+                image = applyHighlighter(hl, to: image, in: cropRect, localTime: localT)
+            }
+            // 4. Geometric Mask (rounded corners / ellipse / circle + feather) inside cropped rect.
+            if let tf, tf.hasMask, let mask = makeMask(rect: cropRect, shape: tf.maskShape,
+                                                       cornerRadius: tf.cornerRadius, feather: tf.maskFeather) {
+                let clear = CIImage(color: .clear).cropped(to: cropRect)
+                image = image.applyingFilter("CIBlendWithMask", parameters: [
+                    kCIInputBackgroundImageKey: clear,
+                    kCIInputMaskImageKey: mask,
+                ]).cropped(to: cropRect)
+            }
+            // 4b. Card Polish: corner rounding, border stroke, and cinematic drop shadow.
+            if let st = layer.style {
+                image = applyClipStyle(st, to: image, in: cropRect, canvas: size)
+            }
+            // 5. Keyframes + Motion Animation + Transform Affine (Preview == Export).
+            var effectiveTF = tf ?? ClipTransform()
+            var motionOpacity = 1.0
+            if let keys = layer.keyframes, let kf = ClipKeyframe.interpolate(keys, at: localT) {
+                effectiveTF.x = kf.x
+                effectiveTF.y = kf.y
+                effectiveTF.scale = kf.scale
+                effectiveTF.rotation = kf.rotation
+                motionOpacity *= kf.opacity.clamped(to: 0...1)
+            }
+            if let anim = layer.animation {
+                let m = anim.evaluate(localTime: localT, duration: clipDur)
+                effectiveTF.x += m.dx
+                effectiveTF.y += m.dy
+                effectiveTF.scale = (effectiveTF.scale * m.scaleMul).clamped(to: ClipTransform.scaleRange)
+                effectiveTF.rotation += m.rotDelta
+                motionOpacity *= m.opacityMul
+            }
+            if abs(effectiveTF.scale - 1) > 1e-6 || abs(effectiveTF.rotation) > 1e-6
+                || abs(effectiveTF.x) > 1e-6 || abs(effectiveTF.y) > 1e-6 {
+                image = image.transformed(by: effectiveTF.affine(canvasSize: size, yUp: true))
             }
             if let cube = layer.cube {
                 image = image.applyingFilter("CIColorCube", parameters: [
@@ -782,12 +841,18 @@ final class TimelineCompositor: NSObject, AVVideoCompositing {
                     "inputCubeData": cube,
                 ])
             }
-            if opacity < 0.999 {
+            let finalOpacity = opacity * motionOpacity
+            if finalOpacity <= 0.001 { continue }
+            if finalOpacity < 0.999 {
                 image = image.applyingFilter("CIColorMatrix", parameters: [
-                    "inputAVector": CIVector(x: 0, y: 0, z: 0, w: opacity),
+                    "inputAVector": CIVector(x: 0, y: 0, z: 0, w: finalOpacity),
                 ])
             }
             out = image.composited(over: out)
+            // 6. Optional Animated Broadcast Lower Third rendered crisply on top of this clip.
+            if let lt = layer.lowerThird, let ltImg = renderLowerThird(lt, canvas: size, localTime: localT, duration: clipDur) {
+                out = ltImg.composited(over: out)
+            }
         }
         if instruction.offset != .zero || output != size {
             out = out.transformed(by: CGAffineTransform(translationX: -instruction.offset.x, y: -instruction.offset.y))
@@ -797,5 +862,157 @@ final class TimelineCompositor: NSObject, AVVideoCompositing {
             if let image = caption.image(output: output) { out = image.composited(over: out) }
         }
         return out.cropped(to: CGRect(origin: .zero, size: output))
+    }
+
+    // MARK: Modern Visual Effects (Privacy Blur, Animated Highlighter, Card Polish, Lower Third)
+
+    private static func applyPrivacyBlur(_ pb: PrivacyBlur, to image: CIImage, in rect: CGRect) -> CIImage {
+        let zw = rect.width * CGFloat(pb.width), zh = rect.height * CGFloat(pb.height)
+        let zx = rect.minX + rect.width * CGFloat(pb.x) - zw / 2
+        let zy = rect.minY + rect.height * CGFloat(1 - pb.y) - zh / 2
+        let zone = CGRect(x: zx, y: zy, width: zw, height: zh).intersection(rect)
+        guard zone.width > 2, zone.height > 2 else { return image }
+        let blurred: CIImage
+        if pb.pixelate {
+            let scale = max(6, CGFloat(pb.strength) * min(rect.width, rect.height) * 0.045)
+            blurred = image.clampedToExtent()
+                .applyingFilter("CIPixellate", parameters: [kCIInputScaleKey: scale])
+                .cropped(to: zone)
+        } else {
+            let radius = max(6, CGFloat(pb.strength) * 32.0)
+            blurred = image.clampedToExtent()
+                .applyingFilter("CIGaussianBlur", parameters: [kCIInputRadiusKey: radius])
+                .cropped(to: zone)
+        }
+        return blurred.composited(over: image).cropped(to: rect)
+    }
+
+    private static func applyHighlighter(_ hl: ClipHighlight, to image: CIImage, in rect: CGRect, localTime: Double) -> CIImage {
+        guard localTime >= hl.startOffset else { return image }
+        let raw = ((localTime - hl.startOffset) / max(0.05, hl.wipeDuration)).clamped(to: 0...1)
+        let progress = 1 - pow(1 - raw, 3) // ease-out stroke
+        let fullW = rect.width * CGFloat(hl.width)
+        let barW = fullW * CGFloat(progress)
+        let barH = rect.height * CGFloat(hl.height)
+        guard barW > 1, barH > 1 else { return image }
+        let leftX = rect.minX + rect.width * CGFloat(hl.x) - fullW / 2
+        let botY = rect.minY + rect.height * CGFloat(1 - hl.y) - barH / 2
+        let barRect = CGRect(x: leftX, y: botY, width: barW, height: barH).intersection(rect)
+        guard !barRect.isEmpty else { return image }
+        let bar = CIImage(color: CIColor(red: hl.color.r, green: hl.color.g, blue: hl.color.b, alpha: hl.color.a))
+            .cropped(to: barRect)
+        // Multiply-style vibrant translucent marker stroke over white news cards & video alike.
+        return bar.composited(over: image).cropped(to: rect)
+    }
+
+    private static func applyClipStyle(_ st: ClipStyle, to image: CIImage, in rect: CGRect, canvas: CGSize) -> CIImage {
+        var out = image
+        let shortSide = min(rect.width, rect.height)
+        // 1. Optional corner rounding (independent of geometric mask, great on cropped cards).
+        if st.cornerRadius > 1e-4, let mask = makeMask(rect: rect, shape: .roundedRect, cornerRadius: st.cornerRadius, feather: 0) {
+            let clear = CIImage(color: .clear).cropped(to: rect)
+            out = out.applyingFilter("CIBlendWithMask", parameters: [
+                kCIInputBackgroundImageKey: clear,
+                kCIInputMaskImageKey: mask,
+            ]).cropped(to: rect)
+        }
+        // 2. Crisp border outline around the card/clip edge.
+        if st.borderWidth > 0.25 {
+            let bw = CGFloat(st.borderWidth) * min(canvas.width, canvas.height) / 1080
+            let w = Int(ceil(rect.width)), h = Int(ceil(rect.height))
+            if w > 4, h > 4,
+               let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0,
+                                   space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                   bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue) {
+                let insetRect = CGRect(x: bw / 2, y: bw / 2, width: max(1, CGFloat(w) - bw), height: max(1, CGFloat(h) - bw))
+                let cr = shortSide * CGFloat(st.cornerRadius.clamped(to: 0...0.5))
+                ctx.addPath(CGPath(roundedRect: insetRect, cornerWidth: cr, cornerHeight: cr, transform: nil))
+                ctx.setStrokeColor(CGColor(srgbRed: st.borderColor.r, green: st.borderColor.g, blue: st.borderColor.b, alpha: st.borderColor.a))
+                ctx.setLineWidth(bw)
+                ctx.strokePath()
+                if let cg = ctx.makeImage() {
+                    let borderImg = CIImage(cgImage: cg).transformed(by: CGAffineTransform(translationX: rect.minX, y: rect.minY))
+                    out = borderImg.composited(over: out)
+                }
+            }
+        }
+        // 3. Cinematic drop shadow derived from the clip's own alpha (works even on AI Card & AI Person cutouts!).
+        if st.shadowOpacity > 0.01 {
+            let scale = min(canvas.width, canvas.height) / 1080
+            let radius = CGFloat(st.shadowRadius) * scale
+            let dy = -CGFloat(st.shadowOffsetY) * scale // Core Image is y-up, so positive offsetY drops downward.
+            let pad = ceil(radius * 2.5 + abs(dy) + 8)
+            let shadowBounds = rect.insetBy(dx: -pad, dy: -pad)
+            let blackAlpha = out.applyingFilter("CIColorMatrix", parameters: [
+                "inputRVector": CIVector(x: 0, y: 0, z: 0, w: 0),
+                "inputGVector": CIVector(x: 0, y: 0, z: 0, w: 0),
+                "inputBVector": CIVector(x: 0, y: 0, z: 0, w: 0),
+                "inputAVector": CIVector(x: 0, y: 0, z: 0, w: st.shadowOpacity),
+            ])
+            let clearPad = CIImage(color: .clear).cropped(to: shadowBounds)
+            let shadow = blackAlpha.composited(over: clearPad)
+                .applyingFilter("CIGaussianBlur", parameters: [kCIInputRadiusKey: radius])
+                .transformed(by: CGAffineTransform(translationX: 0, y: dy))
+                .cropped(to: shadowBounds)
+            out = out.composited(over: shadow)
+        }
+        return out
+    }
+
+    private static func renderLowerThird(_ lt: LowerThird, canvas: CGSize, localTime: Double, duration: Double) -> CIImage? {
+        guard !lt.title.trimmingCharacters(in: .whitespaces).isEmpty else { return nil }
+        let scale = min(canvas.width, canvas.height) / 1080
+        let inU = (localTime / 0.35).clamped(to: 0...1)
+        let outU = ((duration - localTime) / 0.30).clamped(to: 0...1)
+        let u = min(inU, outU)
+        let ease = 1 - pow(1 - u, 3)
+        if ease <= 0.01 { return nil }
+
+        let titleFont = NSFont.systemFont(ofSize: 38 * scale, weight: .heavy)
+        let subFont = NSFont.systemFont(ofSize: 22 * scale, weight: .semibold)
+        let titleAttr: [NSAttributedString.Key: Any] = [.font: titleFont, .foregroundColor: NSColor.white]
+        let subAttr: [NSAttributedString.Key: Any] = [.font: subFont, .foregroundColor: NSColor.white.withAlphaComponent(0.84)]
+        let tSize = (lt.title as NSString).size(withAttributes: titleAttr)
+        let sSize = lt.subtitle.isEmpty ? .zero : (lt.subtitle as NSString).size(withAttributes: subAttr)
+
+        let padX = 22 * scale, padY = 14 * scale, barW = 8 * scale
+        let boxW = min(canvas.width * 0.88, ceil(max(tSize.width, sSize.width) + padX * 2 + barW + 10 * scale))
+        let boxH = ceil(tSize.height + (lt.subtitle.isEmpty ? 0 : sSize.height + 4 * scale) + padY * 2)
+        let iw = Int(boxW), ih = Int(boxH)
+        guard iw > 4, ih > 4,
+              let ctx = CGContext(data: nil, width: iw, height: ih, bitsPerComponent: 8, bytesPerRow: 0,
+                                  space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue)
+        else { return nil }
+
+        let boxRect = CGRect(x: 0, y: 0, width: boxW, height: boxH)
+        let rounded = CGPath(roundedRect: boxRect, cornerWidth: 10 * scale, cornerHeight: 10 * scale, transform: nil)
+        ctx.addPath(rounded)
+        ctx.clip()
+        ctx.setFillColor(CGColor(srgbRed: 0.06, green: 0.07, blue: 0.10, alpha: 0.90))
+        ctx.fill(boxRect)
+
+        ctx.setFillColor(CGColor(srgbRed: lt.accentColor.r, green: lt.accentColor.g, blue: lt.accentColor.b, alpha: 1))
+        ctx.fill(CGRect(x: 0, y: 0, width: barW, height: boxH))
+
+        let g = NSGraphicsContext(cgContext: ctx, flipped: false)
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = g
+        let textX = barW + padX * 0.8
+        if lt.subtitle.isEmpty {
+            (lt.title as NSString).draw(at: CGPoint(x: textX, y: (boxH - tSize.height) / 2), withAttributes: titleAttr)
+        } else {
+            (lt.subtitle as NSString).draw(at: CGPoint(x: textX, y: padY), withAttributes: subAttr)
+            (lt.title as NSString).draw(at: CGPoint(x: textX, y: padY + sSize.height + 4 * scale), withAttributes: titleAttr)
+        }
+        NSGraphicsContext.restoreGraphicsState()
+
+        guard let cg = ctx.makeImage() else { return nil }
+        let marginX = canvas.width * 0.06
+        let slideX = -CGFloat(1 - ease) * (boxW * 0.35)
+        let posY = (1 - CGFloat(lt.y)) * canvas.height - boxH / 2
+        return CIImage(cgImage: cg)
+            .transformed(by: CGAffineTransform(translationX: marginX + slideX, y: max(16 * scale, min(canvas.height - boxH - 16 * scale, posY))))
+            .applyingFilter("CIColorMatrix", parameters: ["inputAVector": CIVector(x: 0, y: 0, z: 0, w: ease)])
     }
 }

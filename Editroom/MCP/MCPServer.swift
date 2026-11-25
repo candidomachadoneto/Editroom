@@ -305,8 +305,10 @@ enum MCPHandler {
                 if let activity { MagicState.shared.finish(activity: activity) }
                 let edits: Set<String> = ["add_clip", "add_title", "move_clip", "trim_clip", "split_clip", "delete_clips", "set_speed", "set_speed_ramp", "set_captions",
                                           "set_grade", "set_audio", "set_transition", "set_sequence", "add_track", "history", "download_media",
-                                          "set_marker", "delete_markers", "set_in_out", "set_transform", "set_crop", "set_mask", "set_background_removal", "set_title_style", "freeze_frame",
-                                          "reverse_clip", "detach_audio", "duplicate_clip", "set_track", "add_solid", "set_solid_color"]
+                                          "set_marker", "delete_markers", "set_in_out", "set_transform", "set_crop", "set_mask", "set_background_removal",
+                                          "set_clip_style", "set_animation", "set_keyframes", "set_highlighter", "set_privacy_blur", "set_lower_third",
+                                          "auto_reframe_face", "remove_silences", "set_voice_enhance", "apply_news_reel_macro",
+                                          "set_title_style", "freeze_frame", "reverse_clip", "detach_audio", "duplicate_clip", "set_track", "add_solid", "set_solid_color"]
                 if let draft, edits.contains(name) { MagicThinking.current?.plan(draft.project) }
             }
             do {
@@ -373,6 +375,17 @@ enum MCPHandler {
         case "set_crop": return on("cropping", clip())
         case "set_mask": return on("masking", clip())
         case "set_background_removal": return on("removing background on", clip())
+        case "set_clip_style": return on("polishing style on", clip())
+        case "set_animation": return on("animating", clip())
+        case "set_keyframes": return on("keyframing", clip())
+        case "set_highlighter": return on("highlighting headline on", clip())
+        case "set_privacy_blur": return on("blurring sensitive area on", clip())
+        case "set_lower_third": return on("adding lower third on", clip())
+        case "auto_reframe_face": return "auto-reframing on face"
+        case "remove_silences": return "removing silences"
+        case "set_voice_enhance": return "enhancing voice"
+        case "snapshot_frame": return "saving frame PNG"
+        case "apply_news_reel_macro": return "building News Reel 9:16"
         case "set_title_style": return "styling the title"
         case "set_sequence": return "setting up the sequence"
         case "add_track", "set_track": return "arranging tracks"

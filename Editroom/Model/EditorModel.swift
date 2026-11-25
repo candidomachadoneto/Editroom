@@ -3,6 +3,7 @@ import AppKit
 import AVFoundation
 import Combine
 import UniformTypeIdentifiers
+import Vision
 
 enum Tool { case move, cut }
 
@@ -124,6 +125,18 @@ final class EditorModel: ObservableObject {
     @Published private(set) var viewerOnly = false
     @Published private(set) var importCount = 0
     @Published var importError: String?
+    /// Transient HUD toast shown in the preview bar (e.g. "Saved PNG", "Removed 6 silences").
+    @Published var statusToast: String?
+    private var toastTask: Task<Void, Never>?
+
+    func showToast(_ message: String, seconds: Double = 2.6) {
+        statusToast = message
+        toastTask?.cancel()
+        toastTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+            if !Task.isCancelled { self?.statusToast = nil }
+        }
+    }
 
     let view = TimelineViewState()
     let clock = Clock()
@@ -2077,6 +2090,294 @@ final class EditorModel: ObservableObject {
             p.fps = fps
             p.settingsLocked = true
         }
+    }
+
+    // MARK: Modern AI & Automation Tools (Auto-Reframe, Silence Cut, Snapshot, News Reel Macro)
+
+    /// Detects the speaker's face on Apple Neural Engine (`VNDetectFaceRectanglesRequest`) across sampled
+    /// frames of each target video/image clip, computes cover scale for the current sequence aspect ratio
+    /// (e.g. 9:16 vertical or 1:1 square), and applies smooth centered framing or animated keyframes.
+    @discardableResult
+    func autoReframeFaces(clipIDs: Set<UUID>) async -> Int {
+        let targets = project.clips.filter { clipIDs.contains($0.id) && ($0.kind == .video || $0.kind == .image) && !project.isLocked($0.trackID) }
+        guard !targets.isEmpty else { return 0 }
+        let canvasW = Double(project.width), canvasH = Double(project.height)
+        guard canvasW > 0, canvasH > 0 else { return 0 }
+
+        var updates: [UUID: (tf: ClipTransform, keys: [ClipKeyframe]?)] = [:]
+        for clip in targets {
+            guard let aid = clip.assetID, let asset = project.asset(aid) else { continue }
+            let srcW = Double(asset.width > 0 ? asset.width : project.width)
+            let srcH = Double(asset.height > 0 ? asset.height : project.height)
+            let fitScale = min(canvasW / srcW, canvasH / srcH)
+            let coverScale = max(canvasW / srcW, canvasH / srcH)
+            let baseW = srcW * fitScale
+            let baseH = srcH * fitScale
+            let neededScale = max(1.0, (coverScale / max(fitScale, 1e-6))).clamped(to: ClipTransform.scaleRange)
+
+            var samples: [(t: Double, faceX: Double, faceY: Double)] = []
+            if clip.kind == .image, let cg = media.still(aid) {
+                if let pt = Self.detectPrimaryFace(in: cg) {
+                    samples.append((0, pt.x, pt.y))
+                }
+            } else if clip.kind == .video, let url = asset.playablePath.map(URL.init(fileURLWithPath:)) ?? Optional(asset.url) {
+                let avAsset = AVURLAsset(url: url)
+                let gen = AVAssetImageGenerator(asset: avAsset)
+                gen.appliesPreferredTrackTransform = true
+                gen.maximumSize = CGSize(width: 640, height: 640)
+                gen.requestedTimeToleranceBefore = CMTime(seconds: 0.25, preferredTimescale: 600)
+                gen.requestedTimeToleranceAfter = CMTime(seconds: 0.25, preferredTimescale: 600)
+                let count = min(12, max(1, Int(ceil(clip.duration / 1.5))))
+                for idx in 0..<count {
+                    let frac = count == 1 ? 0.5 : Double(idx) / Double(count - 1)
+                    let localT = frac * clip.duration
+                    let srcT = clip.sourceTime(at: clip.start + localT)
+                    if let cg = try? await gen.image(at: CMTime(seconds: max(0, srcT), preferredTimescale: 600)).image,
+                       let pt = Self.detectPrimaryFace(in: cg) {
+                        samples.append((localT, pt.x, pt.y))
+                    }
+                }
+            }
+
+            guard !samples.isEmpty else { continue }
+            // Target eye/face vertical sweet spot: upper third on vertical 9:16, center-upper on landscape.
+            let targetY = canvasH > canvasW ? 0.36 : 0.42
+            func framePoint(faceX: Double, faceY: Double) -> (x: Double, y: Double) {
+                // faceX/faceY are normalized top-left (0...1) inside the fitted base rect.
+                let px = (0.5 - faceX) * (baseW / canvasW) * neededScale
+                let py = (targetY - faceY) * (baseH / canvasH) * neededScale
+                let maxX = max(0, (baseW * neededScale - canvasW) / (2 * canvasW))
+                let maxY = max(0, (baseH * neededScale - canvasH) / (2 * canvasH))
+                return (px.clamped(to: -maxX...maxX), py.clamped(to: -maxY...maxY))
+            }
+
+            let existing = clip.transform ?? ClipTransform()
+            var tf = existing
+            tf.scale = neededScale
+            let pts = samples.map { s -> (t: Double, x: Double, y: Double) in
+                let p = framePoint(faceX: s.faceX, faceY: s.faceY)
+                return (s.t, p.x, p.y)
+            }
+            let xSpan = (pts.map(\.x).max() ?? 0) - (pts.map(\.x).min() ?? 0)
+            let ySpan = (pts.map(\.y).max() ?? 0) - (pts.map(\.y).min() ?? 0)
+            if pts.count >= 2 && (xSpan > 0.04 || ySpan > 0.04) {
+                // Smooth moving face with keyframes across the clip!
+                let keys = pts.map { ClipKeyframe(time: $0.t, x: $0.x, y: $0.y, scale: neededScale, rotation: existing.rotation, opacity: existing.opacity) }
+                tf.x = pts[0].x
+                tf.y = pts[0].y
+                updates[clip.id] = (tf, keys)
+            } else {
+                let avgX = pts.map(\.x).reduce(0, +) / Double(pts.count)
+                let avgY = pts.map(\.y).reduce(0, +) / Double(pts.count)
+                tf.x = avgX
+                tf.y = avgY
+                updates[clip.id] = (tf, nil)
+            }
+        }
+
+        guard !updates.isEmpty else {
+            showToast("No face detected in selected clip")
+            return 0
+        }
+        mutate { p in
+            for i in p.clips.indices {
+                if let u = updates[p.clips[i].id] {
+                    var t = u.tf
+                    t.clampAll()
+                    p.clips[i].transform = t.isIdentity ? nil : t
+                    p.clips[i].keyframes = u.keys
+                }
+            }
+        }
+        AppleHaptics.align()
+        showToast("Auto-reframed \(updates.count) clip\(updates.count == 1 ? "" : "s") on face")
+        return updates.count
+    }
+
+    /// Runs Apple Neural Engine `VNDetectFaceRectanglesRequest` and returns primary face center in top-left normalized coords.
+    private nonisolated static func detectPrimaryFace(in cg: CGImage) -> CGPoint? {
+        let req = VNDetectFaceRectanglesRequest()
+        let handler = VNImageRequestHandler(cgImage: cg, options: [:])
+        try? handler.perform([req])
+        guard let obs = req.results, !obs.isEmpty else { return nil }
+        // Pick largest face (primary speaker).
+        let best = obs.max { ($0.boundingBox.width * $0.boundingBox.height) < ($1.boundingBox.width * $1.boundingBox.height) }!
+        let b = best.boundingBox
+        // Vision boundingBox is bottom-left normalized; flip Y to top-left normalized.
+        return CGPoint(x: b.midX, y: 1.0 - b.midY)
+    }
+
+    /// Scans selected clips (or all unlocked audio clips if empty) for dead-air pauses below `thresholdDB`
+    /// lasting at least `minSilence` seconds, and ripple-cuts them in 1 single undo step keeping video+audio in sync.
+    @discardableResult
+    func removeSilences(clipIDs: Set<UUID>, thresholdDB: Double = -34, minSilence: Double = 0.45, padding: Double = 0.08) -> Int {
+        let linked = clipIDs.isEmpty ? Set(project.clips.map(\.id)) : project.linked(clipIDs)
+        let audioClips = project.clips.filter { linked.contains($0.id) && $0.kind == .audio && !project.isLocked($0.trackID) }
+        guard !audioClips.isEmpty else {
+            showToast("No audio clips to analyze")
+            return 0
+        }
+        let thresholdLin = Float(dbToLinear(thresholdDB))
+        let step = 0.04
+        var cuts: [(start: Double, end: Double, tracks: Set<UUID>)] = []
+
+        for c in audioClips {
+            guard let wf = media.waveform(c), !wf.peaks.isEmpty else { continue }
+            let group = project.linked([c.id])
+            let tracks = Set(project.clips.filter { group.contains($0.id) }.map(\.trackID))
+            var silentStart: Double?
+            var t = c.start
+            while t < c.end {
+                let s0 = c.sourceTime(at: t)
+                let s1 = c.sourceTime(at: min(c.end, t + step))
+                let lo = max(0, Int(min(s0, s1) * wf.peaksPerSecond))
+                let hi = min(wf.peaks.count - 1, Int(max(s0, s1) * wf.peaksPerSecond))
+                var peak: Float = 0
+                if hi >= lo { for i in lo...hi { peak = max(peak, wf.peaks[i]) } }
+                let level = peak * Float(dbToLinear(c.gainDB))
+                if level < thresholdLin {
+                    if silentStart == nil { silentStart = t }
+                } else if let s = silentStart {
+                    let cutA = s + padding
+                    let cutB = t - padding
+                    if cutB - cutA >= minSilence {
+                        cuts.append((project.snapFrame(cutA), project.snapFrame(cutB), tracks))
+                    }
+                    silentStart = nil
+                }
+                t += step
+            }
+            if let s = silentStart {
+                let cutA = s + padding
+                let cutB = c.end - padding
+                if cutB - cutA >= minSilence {
+                    cuts.append((project.snapFrame(cutA), project.snapFrame(cutB), tracks))
+                }
+            }
+        }
+
+        // Sort descending so earlier ripple cuts never shift later cut timestamps!
+        cuts.sort { $0.start > $1.start }
+        var applied = 0
+        var totalTrimmed = 0.0
+        guard !cuts.isEmpty else {
+            showToast("No silences longer than \(String(format: "%.2fs", minSilence)) found")
+            return 0
+        }
+        mutate { p in
+            for cut in cuts where cut.end > cut.start + 1 / p.fps {
+                p.rippleRemove(from: cut.start, to: cut.end, tracks: cut.tracks)
+                applied += 1
+                totalTrimmed += (cut.end - cut.start)
+            }
+        }
+        if applied > 0 {
+            AppleHaptics.align()
+            showToast(String(format: "Removed %d silence%@ (-%.1fs)", applied, applied == 1 ? "" : "s", totalTrimmed))
+        }
+        return applied
+    }
+
+    /// Cuts an exact timeline time span `[a, b]` out of the specified clips (and their linked video/audio tracks)
+    /// with ripple in 1 undo step. Used by the Descript-style Transcript Text Editor.
+    func cutTimeSpan(from a: Double, to b: Double, clipIDs: Set<UUID>? = nil) {
+        let start = project.snapFrame(max(0, a))
+        let end = project.snapFrame(max(start, b))
+        guard end - start >= 1 / project.fps else { return }
+        let tracks: Set<UUID>
+        if let ids = clipIDs, !ids.isEmpty {
+            let linked = project.linked(ids)
+            tracks = Set(project.clips.filter { linked.contains($0.id) }.map(\.trackID))
+        } else {
+            tracks = Set((project.videoTracks + project.audioTracks).map(\.id))
+        }
+        mutate { $0.rippleRemove(from: start, to: end, tracks: tracks) }
+        AppleHaptics.click()
+        showToast(String(format: "Cut %.2fs from timeline", end - start))
+    }
+
+    /// Renders the exact current composited frame at FULL project resolution and writes a PNG file.
+    @discardableResult
+    func snapshotCurrentFrame(to customURL: URL? = nil, reveal: Bool = false) async -> URL? {
+        flushInstantVisual()
+        let p = project
+        guard p.duration > 0 else {
+            showToast("Timeline is empty")
+            return nil
+        }
+        let fullSize = CGSize(width: p.width, height: p.height)
+        guard let built = CompositionBuilder.build(project: p, media: media, renderSize: fullSize, includeAudio: false) else {
+            showToast("Could not render frame")
+            return nil
+        }
+        let gen = AVAssetImageGenerator(asset: built.composition)
+        gen.videoComposition = built.videoComposition
+        gen.requestedTimeToleranceBefore = .zero
+        gen.requestedTimeToleranceAfter = .zero
+        let t = min(max(0, playhead), max(0, built.duration - 1 / p.fps))
+        guard let cg = try? await gen.image(at: CompositionBuilder.time(t)).image else {
+            showToast("Could not capture frame")
+            return nil
+        }
+        let rep = NSBitmapImageRep(cgImage: cg)
+        guard let png = rep.representation(using: .png, properties: [:]) else { return nil }
+        let dest: URL
+        if let customURL {
+            dest = customURL
+        } else {
+            let desktop = FileManager.default.urls(for: .desktopDirectory, in: .userDomainMask).first ?? URL(fileURLWithPath: NSHomeDirectory())
+            let cleanTitle = title.replacingOccurrences(of: "/", with: "-").replacingOccurrences(of: ":", with: "-")
+            let stamp = String(format: "%.2fs", t).replacingOccurrences(of: ".", with: "_")
+            dest = desktop.appendingPathComponent("Editroom-\(cleanTitle)-\(stamp).png")
+        }
+        do {
+            try png.write(to: dest, options: .atomic)
+            AppleHaptics.click()
+            showToast("Saved \(dest.lastPathComponent)")
+            if reveal { NSWorkspace.shared.activateFileViewerSelecting([dest]) }
+            return dest
+        } catch {
+            showToast("Save PNG failed")
+            return nil
+        }
+    }
+
+    /// 1-click "News Reel 9:16" macro:
+    /// 1. Converts sequence to Vertical 1080×1920.
+    /// 2. Auto-reframes V1 clips on the speaker's face (Apple Neural Engine).
+    /// 3. Isolates V2+ news cards (`aiCard`) + applies Card Polish shadow/border/corners + Slide Down entrance.
+    /// 4. Enables Voice Enhance on A1 audio clips & removes dead-air silences.
+    @discardableResult
+    func applyNewsReelMacro() async -> String {
+        let v1ID = project.videoTracks.first?.id
+        let a1ID = project.audioTracks.first?.id
+        let v1Clips = Set(project.clips.filter { $0.trackID == v1ID && ($0.kind == .video || $0.kind == .image) }.map(\.id))
+        let overlayClips = Set(project.clips.filter { $0.trackID != v1ID && ($0.kind == .video || $0.kind == .image) }.map(\.id))
+        let a1Clips = Set(project.clips.filter { $0.trackID == a1ID && $0.kind == .audio }.map(\.id))
+
+        mutate { p in
+            p.width = 1080
+            p.height = 1920
+            p.settingsLocked = true
+            for i in p.clips.indices {
+                if overlayClips.contains(p.clips[i].id) {
+                    if p.clips[i].bgRemoval == nil {
+                        p.clips[i].bgRemoval = BackgroundRemoval(mode: .aiCard, tolerance: 0.5, softness: 0.12, edgeShift: 0)
+                    }
+                    p.clips[i].style = .cardPolish
+                    p.clips[i].animation = ClipAnimation(inPreset: .slideDown, inDuration: 0.35, outPreset: .fade, outDuration: 0.25, loopPreset: .none)
+                }
+                if a1Clips.contains(p.clips[i].id) {
+                    p.clips[i].voiceEnhance = true
+                }
+            }
+        }
+
+        let framed = await autoReframeFaces(clipIDs: v1Clips)
+        let silences = removeSilences(clipIDs: a1Clips)
+        let summary = "News Reel 9:16: \(framed) reframed, \(overlayClips.count) card(s) polished, Voice Enhance ON, \(silences) silences cut"
+        showToast(summary, seconds: 4.0)
+        return summary
     }
 
     // MARK: Files

@@ -8,6 +8,21 @@ struct CaptionTrack: Codable, Hashable {
     var style = CaptionStyle()
 }
 
+/// Viral / broadcast caption presets for 1-click styling.
+enum CaptionPreset: String, Codable, CaseIterable, Identifiable {
+    case classic, tiktokPop, yellowBox, editorial, cinema
+    var id: String { rawValue }
+    var label: String {
+        switch self {
+        case .classic: return "Classic"
+        case .tiktokPop: return "TikTok Pop"
+        case .yellowBox: return "Yellow Box"
+        case .editorial: return "Editorial"
+        case .cinema: return "Cinema"
+        }
+    }
+}
+
 /// How every caption looks. One style for the whole track.
 struct CaptionStyle: Codable, Hashable {
     /// Point size relative to a 1080px frame's shorter side.
@@ -21,10 +36,48 @@ struct CaptionStyle: Codable, Hashable {
     /// A dark edge around the letters, so they read over anything.
     var outline = true
     var outlineColor = RGBA.black
+    /// Optional rounded background box behind the caption (e.g., yellow-on-black news style).
+    var boxColor: RGBA? = nil
+    /// Render captions in bold ALL CAPS (TikTok / Reels style).
+    var uppercase: Bool = false
+    /// Subtle drop shadow behind text.
+    var shadow: Bool = false
 
     static let sizeRange = 28.0...140.0
 
     init() {}
+
+    mutating func apply(preset: CaptionPreset) {
+        switch preset {
+        case .classic:
+            textColor = .white
+            highlightColor = RGBA(r: 1, g: 0.84, b: 0.25, a: 1)
+            outline = true; outlineColor = .black
+            boxColor = nil; uppercase = false; shadow = false; highlight = true
+        case .tiktokPop:
+            textColor = .white
+            highlightColor = RGBA(r: 0.22, g: 0.85, b: 1.0, a: 1)
+            outline = true; outlineColor = .black
+            boxColor = nil; uppercase = true; shadow = true; highlight = true
+        case .yellowBox:
+            textColor = RGBA(r: 1, g: 0.88, b: 0.18, a: 1)
+            highlightColor = .white
+            outline = false; outlineColor = .black
+            boxColor = RGBA(r: 0.04, g: 0.04, b: 0.05, a: 0.86)
+            uppercase = false; shadow = false; highlight = true
+        case .editorial:
+            textColor = RGBA(r: 0.08, g: 0.08, b: 0.10, a: 1)
+            highlightColor = RGBA(r: 0.10, g: 0.35, b: 0.85, a: 1)
+            outline = false; outlineColor = .black
+            boxColor = RGBA(r: 1, g: 1, b: 1, a: 0.94)
+            uppercase = false; shadow = true; highlight = true
+        case .cinema:
+            textColor = RGBA(r: 0.96, g: 0.96, b: 0.94, a: 1)
+            highlightColor = RGBA(r: 1, g: 0.84, b: 0.25, a: 1)
+            outline = false; outlineColor = .black
+            boxColor = nil; uppercase = false; shadow = true; highlight = false
+        }
+    }
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -36,6 +89,9 @@ struct CaptionStyle: Codable, Hashable {
         highlightColor = try c.decodeIfPresent(RGBA.self, forKey: .highlightColor) ?? d.highlightColor
         outline = try c.decodeIfPresent(Bool.self, forKey: .outline) ?? d.outline
         outlineColor = try c.decodeIfPresent(RGBA.self, forKey: .outlineColor) ?? d.outlineColor
+        boxColor = try c.decodeIfPresent(RGBA.self, forKey: .boxColor)
+        uppercase = try c.decodeIfPresent(Bool.self, forKey: .uppercase) ?? false
+        shadow = try c.decodeIfPresent(Bool.self, forKey: .shadow) ?? false
     }
 }
 

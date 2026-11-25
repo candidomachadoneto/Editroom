@@ -105,6 +105,17 @@ struct InspectorView: View {
                 }
             }
             InspectorSection("Style") {
+                // 1-click viral/broadcast caption presets
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 6) {
+                        ForEach(CaptionPreset.allCases, id: \.self) { preset in
+                            Chip(label: preset.label, active: false) {
+                                model.setCaptionStyle { $0.apply(preset: preset) }
+                                AppleHaptics.click()
+                            }
+                        }
+                    }
+                }
                 ParamRow(icon: .symbol("textformat.size"), label: "Size", value: track.style.size, range: CaptionStyle.sizeRange,
                          format: { "\(Int($0.rounded()))" },
                          onEditing: { if !$0 { model.commitLive() } },
@@ -118,6 +129,20 @@ struct InspectorView: View {
                                 toggle: { $0.highlight.toggle() }) { s, c in s.highlightColor = c }
                 captionColorRow("Outline", icon: "a.square", on: track.style.outline, color: track.style.outlineColor,
                                 toggle: { $0.outline.toggle() }) { s, c in s.outlineColor = c }
+                captionColorRow("Box pill", icon: "rectangle.fill", on: track.style.boxColor != nil,
+                                color: track.style.boxColor ?? RGBA(r: 0, g: 0, b: 0, a: 0.78),
+                                toggle: { $0.boxColor = $0.boxColor == nil ? RGBA(r: 0, g: 0, b: 0, a: 0.78) : nil }) { s, c in
+                    s.boxColor = RGBA(r: c.r, g: c.g, b: c.b, a: 0.82)
+                }
+                HStack(spacing: 8) {
+                    Chip(label: "ALL CAPS", active: track.style.uppercase) {
+                        model.setCaptionStyle { $0.uppercase.toggle() }
+                    }
+                    Chip(label: "Shadow", active: track.style.shadow) {
+                        model.setCaptionStyle { $0.shadow.toggle() }
+                    }
+                    Spacer()
+                }
                 if model.captionsWaiting {
                     Text("Listening for what's said in the captioned clips…")
                         .font(.system(size: 10.5))
@@ -185,6 +210,23 @@ struct InspectorView: View {
                     .foregroundStyle(Theme.textFaint)
             }
         }
+        if !p.clips.isEmpty {
+            InspectorSection("Smart Macros") {
+                HStack(spacing: 6) {
+                    Chip(label: "News Reel 9:16", active: false) {
+                        Task { await model.applyNewsReelMacro() }
+                    }
+                    Chip(label: "Cut Silences", active: false) {
+                        _ = model.removeSilences(clipIDs: [])
+                    }
+                    Spacer()
+                }
+                Text("News Reel 9:16 switches to vertical, face-tracks V1, isolates & polishes V2 cards, enhances A1 voice, and cuts silences.")
+                    .font(.system(size: 10))
+                    .foregroundStyle(Theme.textFaint)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
     }
 
     static func fpsLabel(_ fps: Double) -> String {
@@ -232,15 +274,30 @@ struct InspectorView: View {
             InspectorSection("Playback", action: offSpeed || ramped || offGain ? ("Reset", { model.resetPlayback(volume: Set(audio.map(\.id))) }) : nil,
                              marked: offSpeed || ramped || offGain) {
                 if let first = audio.first {
+                    let audioIDs = Set(audio.map(\.id))
+                    let enhanced = audio.allSatisfy { $0.voiceEnhance == true }
                     ParamRow(icon: .symbol("speaker.wave.2"), label: "Volume",
                              value: first.gainDB, range: -60...12, format: formatDB,
                              onEditing: { if !$0 { model.commitLive() } },
                              onChange: { v in
-                                 let audioIDs = Set(audio.map(\.id))
                                  model.live(autoCommit: false) { p in
                                      for i in p.clips.indices where audioIDs.contains(p.clips[i].id) { p.clips[i].gainDB = (v * 10).rounded() / 10 }
                                  }
                              })
+                    HStack(spacing: 6) {
+                        Chip(label: enhanced ? "Voice Enhance ON" : "Voice Enhance", active: enhanced) {
+                            model.mutate { p in
+                                for i in p.clips.indices where audioIDs.contains(p.clips[i].id) {
+                                    p.clips[i].voiceEnhance = enhanced ? nil : true
+                                }
+                            }
+                            AppleHaptics.click()
+                        }
+                        Chip(label: "Cut Silences", active: false) {
+                            _ = model.removeSilences(clipIDs: audioIDs)
+                        }
+                        Spacer()
+                    }
                 }
                 if let first = sourced.first {
                     ParamRow(icon: .symbol("clock.arrow.circlepath"), label: "Speed",
@@ -306,6 +363,10 @@ struct InspectorView: View {
         let cuttable = visual.filter { $0.kind == .video || $0.kind == .image }
         if !cuttable.isEmpty {
             backgroundRemovalSection(cuttable)
+        }
+        if !movable.isEmpty {
+            styleAndMotionSection(movable)
+            newsAndEffectsSection(movable)
         }
         if visual.count == 1 { transitionSection(visual[0]) }
         if !visual.isEmpty { fadeSection(audio.isEmpty ? "Fade" : "Video fade", visual) }
@@ -604,6 +665,9 @@ struct InspectorView: View {
                 ParamRow(icon: .symbol("arrow.left.and.right"), label: "Edge", value: bg.edgeShift * 100,
                          range: -100...100, step: 1, format: { "\(Int($0.rounded()))%" }, onEditing: done,
                          onChange: { v in live { $0.edgeShift = v / 100 } })
+                ParamRow(icon: .symbol("camera.aperture"), label: "BG Blur", value: bg.blurBackground * 100,
+                         range: 0...100, step: 1, format: Self.percentTenths, onEditing: done,
+                         onChange: { v in live { $0.blurBackground = v / 100 } })
                 HStack(spacing: 8) {
                     Chip(label: "Invert Mask", active: bg.invert) {
                         model.mutate { p in
@@ -611,6 +675,300 @@ struct InspectorView: View {
                                 p.clips[i].bgRemoval?.invert.toggle()
                             }
                         }
+                    }
+                }
+            }
+        }
+    }
+
+    @ViewBuilder private func styleAndMotionSection(_ clips: [Clip]) -> some View {
+        let ids = Set(clips.map(\.id))
+        let st = clips[0].style ?? ClipStyle()
+        let anim = clips[0].animation ?? ClipAnimation()
+        let keys = clips[0].keyframes ?? []
+        let hasStyle = !st.isIdentity
+        let hasMotion = !anim.isIdentity || !keys.isEmpty
+        let active = hasStyle || hasMotion
+        let liveStyle: (@escaping (inout ClipStyle) -> Void) -> Void = { body in
+            model.liveVisual(autoCommit: false) { p in
+                for i in p.clips.indices where ids.contains(p.clips[i].id) {
+                    var s = p.clips[i].style ?? ClipStyle()
+                    body(&s)
+                    s.clampAll()
+                    p.clips[i].style = s.isIdentity ? nil : s
+                }
+            }
+        }
+        let setAnim: (@escaping (inout ClipAnimation) -> Void) -> Void = { body in
+            model.mutate { p in
+                for i in p.clips.indices where ids.contains(p.clips[i].id) {
+                    var a = p.clips[i].animation ?? ClipAnimation()
+                    body(&a)
+                    p.clips[i].animation = a.isIdentity ? nil : a
+                }
+            }
+        }
+        let done: (Bool) -> Void = { if !$0 { model.commitLive() } }
+
+        InspectorSection("Style & Motion", action: active ? ("Reset", {
+            model.mutate { p in
+                for i in p.clips.indices where ids.contains(p.clips[i].id) {
+                    p.clips[i].style = nil
+                    p.clips[i].animation = nil
+                    p.clips[i].keyframes = nil
+                }
+            }
+        }) : nil, collapsedByDefault: !active, marked: active) {
+            HStack(spacing: 6) {
+                Chip(label: "Card Polish", active: hasStyle) {
+                    model.mutate { p in
+                        for i in p.clips.indices where ids.contains(p.clips[i].id) {
+                            p.clips[i].style = hasStyle ? nil : .cardPolish
+                        }
+                    }
+                    AppleHaptics.click()
+                }
+                if clips.count == 1, clips[0].kind == .video || clips[0].kind == .image {
+                    Chip(label: "Face Track", active: false) {
+                        Task { await model.autoReframeFaces(clipIDs: ids) }
+                    }
+                }
+                Spacer()
+            }
+            ParamRow(icon: .symbol("shadow"), label: "Shadow", value: st.shadowOpacity * 100, range: 0...100, step: 1,
+                     format: Self.percentTenths, onEditing: done,
+                     onChange: { v in liveStyle { $0.shadowOpacity = v / 100; if $0.shadowOpacity > 0.01 && $0.shadowRadius < 2 { $0.shadowRadius = 24; $0.shadowOffsetY = 12 } } })
+            ParamRow(icon: .symbol("square"), label: "Border", value: st.borderWidth, range: 0...24, step: 0.5,
+                     format: { "\(Self.tenths($0))px" }, onEditing: done,
+                     onChange: { v in liveStyle { $0.borderWidth = v } })
+            ParamRow(icon: .symbol("app.dashed"), label: "Corners", value: st.cornerRadius * 100, range: 0...35, step: 1,
+                     format: Self.percentTenths, onEditing: done,
+                     onChange: { v in liveStyle { $0.cornerRadius = v / 100 } })
+
+            HStack(spacing: 8) {
+                Image(systemName: "arrow.down.right.circle").font(.system(size: 11, weight: .medium)).foregroundStyle(Theme.textDim).frame(width: 18)
+                Text("In").font(.system(size: 11.5)).foregroundStyle(Theme.text).frame(width: 52, alignment: .leading)
+                MenuField(label: anim.inPreset.label, height: 26) {
+                    ForEach(MotionPreset.inOutCases, id: \.self) { m in
+                        Button(m.label) { setAnim { $0.inPreset = m } }
+                    }
+                }
+            }
+            HStack(spacing: 8) {
+                Image(systemName: "arrow.up.right.circle").font(.system(size: 11, weight: .medium)).foregroundStyle(Theme.textDim).frame(width: 18)
+                Text("Out").font(.system(size: 11.5)).foregroundStyle(Theme.text).frame(width: 52, alignment: .leading)
+                MenuField(label: anim.outPreset.label, height: 26) {
+                    ForEach(MotionPreset.inOutCases, id: \.self) { m in
+                        Button(m.label) { setAnim { $0.outPreset = m } }
+                    }
+                }
+            }
+            HStack(spacing: 8) {
+                Image(systemName: "repeat").font(.system(size: 11, weight: .medium)).foregroundStyle(Theme.textDim).frame(width: 18)
+                Text("Loop").font(.system(size: 11.5)).foregroundStyle(Theme.text).frame(width: 52, alignment: .leading)
+                MenuField(label: anim.loopPreset.label, height: 26) {
+                    ForEach(MotionPreset.loopCases, id: \.self) { m in
+                        Button(m.label) { setAnim { $0.loopPreset = m } }
+                    }
+                }
+            }
+            if anim.inPreset != .none || anim.outPreset != .none {
+                ParamRow(icon: .symbol("timer"), label: "Speed", value: anim.inDuration, range: 0.1...2.0, step: 0.05,
+                         format: { String(format: "%.2fs", $0) }, onEditing: done,
+                         onChange: { v in
+                             model.liveVisual(autoCommit: false) { p in
+                                 for i in p.clips.indices where ids.contains(p.clips[i].id) {
+                                     var a = p.clips[i].animation ?? ClipAnimation()
+                                     a.inDuration = v; a.outDuration = v
+                                     p.clips[i].animation = a.isIdentity ? nil : a
+                                 }
+                             }
+                         })
+            }
+
+            if clips.count == 1, let c = clips.first {
+                HStack(spacing: 6) {
+                    Image(systemName: "diamond.fill").font(.system(size: 9)).foregroundStyle(keys.isEmpty ? Theme.textDim : Color(hex: 0x38BDF8)).frame(width: 18)
+                    Text(keys.isEmpty ? "Keyframes" : "\(keys.count) Keyframe\(keys.count == 1 ? "" : "s")")
+                        .font(.system(size: 11.5)).foregroundStyle(Theme.text)
+                    Spacer()
+                    Chip(label: "+ Key", active: false) {
+                        let localT = max(0, min(c.duration, model.playhead - c.start))
+                        let tf = c.transform ?? ClipTransform()
+                        let kf = ClipKeyframe(time: localT, x: tf.x, y: tf.y, scale: tf.scale, rotation: tf.rotation, opacity: tf.opacity)
+                        model.mutate { p in
+                            guard let i = p.index(of: c.id) else { return }
+                            var arr = p.clips[i].keyframes ?? []
+                            arr.removeAll { abs($0.time - localT) < 0.05 }
+                            arr.append(kf)
+                            arr.sort { $0.time < $1.time }
+                            p.clips[i].keyframes = arr
+                        }
+                        AppleHaptics.align()
+                    }
+                    if !keys.isEmpty {
+                        Chip(label: "Clear", active: false) {
+                            model.mutate { p in
+                                if let i = p.index(of: c.id) { p.clips[i].keyframes = nil }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    @ViewBuilder private func newsAndEffectsSection(_ clips: [Clip]) -> some View {
+        let ids = Set(clips.map(\.id))
+        let hl = clips[0].highlight
+        let pb = clips[0].privacyBlur
+        let lt = clips[0].lowerThird
+        let active = hl != nil || pb != nil || lt != nil
+        let done: (Bool) -> Void = { if !$0 { model.commitLive() } }
+
+        InspectorSection("News & Effects", action: active ? ("Clear", {
+            model.mutate { p in
+                for i in p.clips.indices where ids.contains(p.clips[i].id) {
+                    p.clips[i].highlight = nil
+                    p.clips[i].privacyBlur = nil
+                    p.clips[i].lowerThird = nil
+                }
+            }
+        }) : nil, collapsedByDefault: !active, marked: active) {
+            // 1. Animated Headline Highlighter
+            HStack(spacing: 8) {
+                Image(systemName: "highlighter").font(.system(size: 11, weight: .medium)).foregroundStyle(hl != nil ? Color(hex: 0xF5C542) : Theme.textDim).frame(width: 18)
+                Text("Highlighter").font(.system(size: 11.5)).foregroundStyle(Theme.text)
+                Spacer()
+                Toggle("", isOn: Binding(get: { hl != nil }, set: { on in
+                    model.mutate { p in
+                        for i in p.clips.indices where ids.contains(p.clips[i].id) {
+                            p.clips[i].highlight = on ? ClipHighlight() : nil
+                        }
+                    }
+                })).toggleStyle(.switch).labelsHidden().controlSize(.small).tint(Color(hex: 0xF5C542))
+            }
+            if let h = hl {
+                let liveHL: (@escaping (inout ClipHighlight) -> Void) -> Void = { body in
+                    model.liveVisual(autoCommit: false) { p in
+                        for i in p.clips.indices where ids.contains(p.clips[i].id) {
+                            var x = p.clips[i].highlight ?? ClipHighlight()
+                            body(&x); x.clampAll()
+                            p.clips[i].highlight = x
+                        }
+                    }
+                }
+                ParamRow(icon: .symbol("arrow.up.and.down"), label: "Line Y", value: h.y * 100, range: 5...95, step: 1,
+                         format: Self.percentTenths, onEditing: done, onChange: { v in liveHL { $0.y = v / 100 } })
+                ParamRow(icon: .symbol("arrow.left.and.right"), label: "Width", value: h.width * 100, range: 10...100, step: 1,
+                         format: Self.percentTenths, onEditing: done, onChange: { v in liveHL { $0.width = v / 100 } })
+                ParamRow(icon: .symbol("rectangle.expand.vertical"), label: "Height", value: h.height * 100, range: 2...35, step: 0.5,
+                         format: Self.percentTenths, onEditing: done, onChange: { v in liveHL { $0.height = v / 100 } })
+                HStack(spacing: 6) {
+                    Spacer()
+                    ForEach([
+                        ("Yellow", RGBA(r: 0.99, g: 0.88, b: 0.20, a: 0.48)),
+                        ("Green", RGBA(r: 0.29, g: 0.87, b: 0.50, a: 0.45)),
+                        ("Cyan", RGBA(r: 0.22, g: 0.74, b: 0.97, a: 0.45)),
+                        ("Coral", RGBA(r: 0.98, g: 0.44, b: 0.52, a: 0.45)),
+                    ], id: \.0) { sw in
+                        Circle().fill(sw.1.color.opacity(0.95)).frame(width: 14, height: 14)
+                            .overlay(Circle().strokeBorder(Theme.ink.opacity(0.3), lineWidth: 1))
+                            .onTapGesture {
+                                model.liveVisual(autoCommit: true) { p in
+                                    for i in p.clips.indices where ids.contains(p.clips[i].id) { p.clips[i].highlight?.color = sw.1 }
+                                }
+                            }
+                    }
+                }
+            }
+
+            // 2. Privacy Blur / Pixelate
+            HStack(spacing: 8) {
+                Image(systemName: "eye.slash").font(.system(size: 11, weight: .medium)).foregroundStyle(pb != nil ? Color(hex: 0x38BDF8) : Theme.textDim).frame(width: 18)
+                Text("Privacy Blur").font(.system(size: 11.5)).foregroundStyle(Theme.text)
+                Spacer()
+                Toggle("", isOn: Binding(get: { pb != nil }, set: { on in
+                    model.mutate { p in
+                        for i in p.clips.indices where ids.contains(p.clips[i].id) {
+                            p.clips[i].privacyBlur = on ? PrivacyBlur() : nil
+                        }
+                    }
+                })).toggleStyle(.switch).labelsHidden().controlSize(.small).tint(Color(hex: 0x38BDF8))
+            }
+            if let b = pb {
+                let livePB: (@escaping (inout PrivacyBlur) -> Void) -> Void = { body in
+                    model.liveVisual(autoCommit: false) { p in
+                        for i in p.clips.indices where ids.contains(p.clips[i].id) {
+                            var x = p.clips[i].privacyBlur ?? PrivacyBlur()
+                            body(&x); x.clampAll()
+                            p.clips[i].privacyBlur = x
+                        }
+                    }
+                }
+                HStack(spacing: 6) {
+                    Chip(label: "Blur", active: !b.pixelate) { model.mutate { p in for i in p.clips.indices where ids.contains(p.clips[i].id) { p.clips[i].privacyBlur?.pixelate = false } } }
+                    Chip(label: "Pixelate", active: b.pixelate) { model.mutate { p in for i in p.clips.indices where ids.contains(p.clips[i].id) { p.clips[i].privacyBlur?.pixelate = true } } }
+                    Spacer()
+                }
+                ParamRow(icon: .symbol("arrow.left.and.right"), label: "X", value: b.x * 100, range: 0...100, step: 1, format: Self.percentTenths, onEditing: done, onChange: { v in livePB { $0.x = v / 100 } })
+                ParamRow(icon: .symbol("arrow.up.and.down"), label: "Y", value: b.y * 100, range: 0...100, step: 1, format: Self.percentTenths, onEditing: done, onChange: { v in livePB { $0.y = v / 100 } })
+                ParamRow(icon: .symbol("arrow.left.and.right.square"), label: "Width", value: b.width * 100, range: 5...100, step: 1, format: Self.percentTenths, onEditing: done, onChange: { v in livePB { $0.width = v / 100 } })
+                ParamRow(icon: .symbol("arrow.up.and.down.square"), label: "Height", value: b.height * 100, range: 5...100, step: 1, format: Self.percentTenths, onEditing: done, onChange: { v in livePB { $0.height = v / 100 } })
+                ParamRow(icon: .symbol("aqi.medium"), label: "Strength", value: b.strength * 100, range: 15...100, step: 1, format: Self.percentTenths, onEditing: done, onChange: { v in livePB { $0.strength = v / 100 } })
+            }
+
+            // 3. Broadcast Lower Third (Tarja)
+            HStack(spacing: 8) {
+                Image(systemName: "rectangle.bottomthird.inset.filled").font(.system(size: 11, weight: .medium)).foregroundStyle(lt != nil ? Color(hex: 0x38BDF8) : Theme.textDim).frame(width: 18)
+                Text("Lower Third").font(.system(size: 11.5)).foregroundStyle(Theme.text)
+                Spacer()
+                Toggle("", isOn: Binding(get: { lt != nil }, set: { on in
+                    model.mutate { p in
+                        for i in p.clips.indices where ids.contains(p.clips[i].id) {
+                            p.clips[i].lowerThird = on ? LowerThird(title: "Breaking News", subtitle: "Live Analysis") : nil
+                        }
+                    }
+                })).toggleStyle(.switch).labelsHidden().controlSize(.small).tint(Color(hex: 0x38BDF8))
+            }
+            if let l = lt {
+                TextField("Title", text: Binding(get: { l.title }, set: { s in
+                    model.liveVisual(autoCommit: true) { p in
+                        for i in p.clips.indices where ids.contains(p.clips[i].id) { p.clips[i].lowerThird?.title = s }
+                    }
+                }))
+                .textFieldStyle(.plain).font(.system(size: 11.5, weight: .semibold)).padding(6)
+                .background(RoundedRectangle(cornerRadius: 6, style: .continuous).fill(Theme.field))
+                TextField("Subtitle", text: Binding(get: { l.subtitle }, set: { s in
+                    model.liveVisual(autoCommit: true) { p in
+                        for i in p.clips.indices where ids.contains(p.clips[i].id) { p.clips[i].lowerThird?.subtitle = s }
+                    }
+                }))
+                .textFieldStyle(.plain).font(.system(size: 11)).padding(6)
+                .background(RoundedRectangle(cornerRadius: 6, style: .continuous).fill(Theme.field))
+                ParamRow(icon: .symbol("arrow.up.and.down"), label: "Y", value: l.y * 100, range: 10...95, step: 1,
+                         format: Self.percentTenths, onEditing: done,
+                         onChange: { v in
+                             model.liveVisual(autoCommit: false) { p in
+                                 for i in p.clips.indices where ids.contains(p.clips[i].id) { p.clips[i].lowerThird?.y = v / 100 }
+                             }
+                         })
+                HStack(spacing: 6) {
+                    Text("Accent").font(.system(size: 11)).foregroundStyle(Theme.textDim)
+                    Spacer()
+                    ForEach([
+                        ("Gold", RGBA(r: 0.96, g: 0.77, b: 0.26, a: 1)),
+                        ("Cyan", RGBA(r: 0.22, g: 0.74, b: 0.97, a: 1)),
+                        ("Red", RGBA(r: 0.93, g: 0.26, b: 0.26, a: 1)),
+                        ("Green", RGBA(r: 0.13, g: 0.77, b: 0.37, a: 1)),
+                    ], id: \.0) { sw in
+                        Circle().fill(sw.1.color).frame(width: 14, height: 14)
+                            .overlay(Circle().strokeBorder(Theme.ink.opacity(0.3), lineWidth: 1))
+                            .onTapGesture {
+                                model.liveVisual(autoCommit: true) { p in
+                                    for i in p.clips.indices where ids.contains(p.clips[i].id) { p.clips[i].lowerThird?.accentColor = sw.1 }
+                                }
+                            }
                     }
                 }
             }

@@ -2,8 +2,11 @@ import SwiftUI
 import UniformTypeIdentifiers
 
 struct LibraryView: View {
+    private enum PanelTab { case media, script }
+
     @ObservedObject var model: EditorModel
     @ObservedObject var media: MediaStore
+    @State private var tab: PanelTab = .media
     @State private var dropTargeted = false
     @State private var search = ""
     /// Thumbnails (the default) or a list, from Settings > General.
@@ -66,10 +69,10 @@ struct LibraryView: View {
         let inSelection = Set(model.selection.compactMap { model.project.clip($0)?.assetID })
         VStack(spacing: 0) {
             HStack(spacing: 6) {
-                Text("MEDIA")
-                    .font(Theme.label())
-                    .kerning(1.6)
-                    .foregroundStyle(Theme.textDim)
+                HStack(spacing: 2) {
+                    tabPill("MEDIA", selected: tab == .media) { tab = .media }
+                    tabPill("SCRIPT", selected: tab == .script) { tab = .script }
+                }
                 if model.importCount > 0 {
                     ProgressView().controlSize(.small).scaleEffect(0.6).frame(width: 14, height: 14)
                 }
@@ -78,13 +81,16 @@ struct LibraryView: View {
                 AddButton(model: model, symbol: "solid", payload: .solid, help: "Solid: click to add at the playhead, or drag to the timeline")
                 IconButton(symbol: "square.and.arrow.down", size: 26, help: "Import Media (⌘I)") { model.showImportPanel() }
             }
-            .padding(.leading, 16)
+            .padding(.leading, 12)
             .padding(.trailing, 12)
             .frame(height: 44)
             .contentShape(Rectangle())
             // Right-click: the header buttons' actions in words, and how the list looks.
             .contextMenu { panelMenu }
 
+            if tab == .script {
+                ScriptEditorView(model: model, media: media, clock: model.clock)
+            } else {
             ScrollView {
                 VStack(alignment: .leading, spacing: 12) {
                     if model.project.assets.isEmpty {
@@ -134,6 +140,7 @@ struct LibraryView: View {
             .background(MagicAnchor(key: "libraryList"))
             // The same menu on the space around the items (each item keeps its own).
             .contextMenu { panelMenu }
+            }
         }
         .background(Theme.panel)
         .background(GeometryReader { g in
@@ -154,6 +161,19 @@ struct LibraryView: View {
 }
 
 extension LibraryView {
+    private func tabPill(_ label: String, selected: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Text(label)
+                .font(Theme.label())
+                .kerning(1.2)
+                .foregroundStyle(selected ? Theme.text : Theme.textFaint)
+                .padding(.horizontal, 7)
+                .frame(height: 22)
+                .background(RoundedRectangle(cornerRadius: 6, style: .continuous).fill(selected ? Theme.raised : .clear))
+        }
+        .buttonStyle(.plain)
+    }
+
     /// The Media panel's own menu: add a text or solid at the playhead, import, and List or Thumbnails.
     @ViewBuilder var panelMenu: some View {
         Button("Add Text") { model.addAtPlayhead(.text) }
@@ -165,6 +185,179 @@ extension LibraryView {
             ForEach(MediaLayout.allCases) { Text($0.name).tag($0) }
         }
         .pickerStyle(.inline)
+    }
+}
+
+/// Descript-style live Transcript Text Editor: click any sentence to jump the playhead there,
+/// or click the scissors icon to ripple-cut that exact phrase out of video + audio in 1 undo step.
+private struct ScriptEditorView: View {
+    @ObservedObject var model: EditorModel
+    @ObservedObject var media: MediaStore
+    @ObservedObject var clock: Clock
+    @ObservedObject private var transcripts = Transcripts.shared
+    @State private var filter = ""
+    @State private var hoveredID: String?
+
+    private struct SentenceLine: Identifiable {
+        let id: String
+        let clipID: UUID
+        let start: Double
+        let end: Double
+        let text: String
+    }
+
+    private var lines: [SentenceLine] {
+        let audioClips = model.project.clips
+            .filter { $0.kind == .audio && $0.assetID != nil }
+            .sorted { $0.start < $1.start }
+        var out: [SentenceLine] = []
+        let q = filter.trimmingCharacters(in: .whitespaces).lowercased()
+        for c in audioClips {
+            guard let aid = c.assetID, let tr = media.transcript(aid), !tr.isEmpty else { continue }
+            let s0 = c.sourceStart
+            let s1 = c.sourceStart + c.sourceLength
+            let spd = max(0.05, c.speed)
+            for (idx, sent) in tr.sentences().enumerated() {
+                guard sent.end > s0 && sent.start < s1 else { continue }
+                let clippedStart = max(s0, sent.start)
+                let clippedEnd = min(s1, sent.end)
+                let tStart = c.start + (clippedStart - s0) / spd
+                let tEnd = min(c.end, c.start + (clippedEnd - s0) / spd)
+                guard tEnd - tStart > 0.04 else { continue }
+                if !q.isEmpty, !sent.text.lowercased().contains(q) { continue }
+                out.append(SentenceLine(id: "\(c.id.uuidString)-\(idx)", clipID: c.id, start: tStart, end: tEnd, text: sent.text))
+            }
+        }
+        return out
+    }
+
+    var body: some View {
+        let now = Double(clock.frame) / max(1, model.project.fps)
+        let items = lines
+        VStack(spacing: 8) {
+            HStack(spacing: 6) {
+                Button {
+                    _ = model.removeSilences(clipIDs: [])
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: "scissors").font(.system(size: 10, weight: .semibold))
+                        Text("Cut Silences").font(.system(size: 10.5, weight: .medium))
+                    }
+                    .foregroundStyle(Theme.text)
+                    .padding(.horizontal, 8)
+                    .frame(height: 24)
+                    .background(RoundedRectangle(cornerRadius: 6, style: .continuous).fill(Theme.raised))
+                }
+                .buttonStyle(.plain)
+                .help("Automatically remove dead air across timeline audio clips")
+
+                let allEnhanced = !model.project.clips.filter({ $0.kind == .audio }).isEmpty
+                    && model.project.clips.filter({ $0.kind == .audio }).allSatisfy { $0.voiceEnhance == true }
+                Button {
+                    model.mutate { p in
+                        for i in p.clips.indices where p.clips[i].kind == .audio {
+                            p.clips[i].voiceEnhance = allEnhanced ? nil : true
+                        }
+                    }
+                    AppleHaptics.click()
+                    model.showToast(allEnhanced ? "Voice Enhance OFF" : "Voice Enhance ON")
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: "waveform.badge.magnifyingglass").font(.system(size: 10, weight: .semibold))
+                        Text("Enhance").font(.system(size: 10.5, weight: .medium))
+                    }
+                    .foregroundStyle(allEnhanced ? Color.black : Theme.text)
+                    .padding(.horizontal, 8)
+                    .frame(height: 24)
+                    .background(RoundedRectangle(cornerRadius: 6, style: .continuous).fill(allEnhanced ? Color(hex: 0x38BDF8) : Theme.raised))
+                }
+                .buttonStyle(.plain)
+                .help("Studio Voice Enhance (HPF + Presence EQ + Limiter)")
+
+                Spacer()
+            }
+            .padding(.horizontal, 12)
+
+            SearchField(text: $filter)
+                .padding(.horizontal, 12)
+
+            if items.isEmpty {
+                VStack(spacing: 10) {
+                    Spacer(minLength: 18)
+                    Image(systemName: "text.alignleft")
+                        .font(.system(size: 22))
+                        .foregroundStyle(Theme.textFaint)
+                    Text(model.project.clips.contains(where: { $0.kind == .audio })
+                         ? "No speech transcript ready yet."
+                         : "Add video or audio with speech to edit by text.")
+                        .font(.system(size: 11.5))
+                        .foregroundStyle(Theme.textFaint)
+                        .multilineTextAlignment(.center)
+                    if model.project.clips.contains(where: { $0.kind == .audio }), Transcripts.available {
+                        Button("Transcribe Timeline") {
+                            for c in model.project.clips where c.kind == .audio {
+                                if let aid = c.assetID, let url = media.soundURL(aid) {
+                                    Transcripts.shared.make(url, soon: true)
+                                }
+                            }
+                            model.showToast("Transcribing timeline audio…")
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                    }
+                    Spacer()
+                }
+                .padding(.horizontal, 16)
+            } else {
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 6) {
+                        ForEach(items) { line in
+                            let active = now >= line.start - 0.05 && now <= line.end + 0.05
+                            let hovering = hoveredID == line.id
+                            HStack(alignment: .top, spacing: 6) {
+                                VStack(alignment: .leading, spacing: 3) {
+                                    Text(Timecode.short(line.start))
+                                        .font(Theme.mono(9.5, .medium))
+                                        .foregroundStyle(active ? Color(hex: 0x38BDF8) : Theme.textFaint)
+                                    Text(line.text)
+                                        .font(.system(size: 11.5))
+                                        .foregroundStyle(active ? Theme.text : Theme.textDim)
+                                        .fixedSize(horizontal: false, vertical: true)
+                                }
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                if hovering || active {
+                                    Button {
+                                        model.cutTimeSpan(from: line.start, to: line.end, clipIDs: [line.clipID])
+                                    } label: {
+                                        Image(systemName: "scissors")
+                                            .font(.system(size: 10.5, weight: .semibold))
+                                            .foregroundStyle(Color(hex: 0xF5C542))
+                                            .frame(width: 22, height: 22)
+                                            .background(RoundedRectangle(cornerRadius: 5, style: .continuous).fill(Theme.raised))
+                                    }
+                                    .buttonStyle(.plain)
+                                    .help("Ripple-cut this sentence out of the timeline")
+                                }
+                            }
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 6)
+                            .background(RoundedRectangle(cornerRadius: 7, style: .continuous)
+                                .fill(active ? Color(hex: 0x38BDF8).opacity(0.14) : (hovering ? Theme.hover : Theme.field.opacity(0.6))))
+                            .overlay(RoundedRectangle(cornerRadius: 7, style: .continuous)
+                                .strokeBorder(active ? Color(hex: 0x38BDF8).opacity(0.65) : .clear, lineWidth: 1))
+                            .contentShape(Rectangle())
+                            .onHover { hoveredID = $0 ? line.id : (hoveredID == line.id ? nil : hoveredID) }
+                            .onTapGesture {
+                                model.seek(to: line.start)
+                                AppleHaptics.tick()
+                            }
+                        }
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.bottom, 12)
+                }
+            }
+        }
     }
 }
 

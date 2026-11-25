@@ -104,8 +104,22 @@ struct Clip: Identifiable, Codable, Hashable {
     var grade: ColorGrade?
     /// Size and placement for video, image and solid clips; nil means fitted to the frame.
     var transform: ClipTransform?
-    /// AI background removal / chroma key for video and image clips; nil means untouched.
+    /// AI background removal / portrait blur / chroma key for video and image clips; nil means untouched.
     var bgRemoval: BackgroundRemoval?
+    /// Card polish: drop shadow, border stroke, and corner radius.
+    var style: ClipStyle?
+    /// CapCut-style entry, exit and loop motion presets.
+    var animation: ClipAnimation?
+    /// Optional per-clip keyframes for animated transform (x, y, scale, rotation, opacity).
+    var keyframes: [ClipKeyframe]?
+    /// Animated translucent highlighter bar (e.g. highlighting a headline on a news card).
+    var highlight: ClipHighlight?
+    /// Blur or pixelate censorship zone inside the clip.
+    var privacyBlur: PrivacyBlur?
+    /// Optional broadcast lower-third graphic (title + subtitle + accent bar).
+    var lowerThird: LowerThird?
+    /// Studio Voice Enhance (high-pass, vocal presence EQ, gentle compression) on audio clips.
+    var voiceEnhance: Bool?
     /// A transition into this clip from the clip that ends where it starts, on the same track.
     var transitionIn: Transition?
     /// A freeze frame: shows the single frame at `sourceStart` for its whole length.
@@ -248,7 +262,7 @@ enum BackgroundRemovalMode: String, Codable, Hashable, CaseIterable {
     }
 }
 
-/// Per-clip AI background removal / chroma key settings with live GPU tolerance and edge controls.
+/// Per-clip AI background removal / portrait blur / chroma key settings with live GPU tolerance and edge controls.
 struct BackgroundRemoval: Codable, Hashable {
     var mode: BackgroundRemovalMode = .aiSubject
     /// Tolerance (`0...1`, default `0.5`): lower = stricter cutout, higher = keeps more edge/foreground detail.
@@ -259,14 +273,248 @@ struct BackgroundRemoval: Codable, Hashable {
     var edgeShift: Double = 0.0
     /// Inverts foreground and background.
     var invert: Bool = false
+    /// Portrait Blur (`0...1`, default `0`): when > 0, blurs the background like a DSLR lens instead of removing it.
+    var blurBackground: Double = 0.0
     /// Target color when `mode == .chromaKey` (default studio green #00B140).
     var keyColor: RGBA = RGBA(r: 0.0, g: 0.694, b: 0.251, a: 1.0)
+
+    init(mode: BackgroundRemovalMode = .aiSubject, tolerance: Double = 0.5, softness: Double = 0.15,
+         edgeShift: Double = 0.0, invert: Bool = false, blurBackground: Double = 0.0,
+         keyColor: RGBA = RGBA(r: 0.0, g: 0.694, b: 0.251, a: 1.0)) {
+        self.mode = mode
+        self.tolerance = tolerance
+        self.softness = softness
+        self.edgeShift = edgeShift
+        self.invert = invert
+        self.blurBackground = blurBackground
+        self.keyColor = keyColor
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        mode = try c.decodeIfPresent(BackgroundRemovalMode.self, forKey: .mode) ?? .aiSubject
+        tolerance = try c.decodeIfPresent(Double.self, forKey: .tolerance) ?? 0.5
+        softness = try c.decodeIfPresent(Double.self, forKey: .softness) ?? 0.15
+        edgeShift = try c.decodeIfPresent(Double.self, forKey: .edgeShift) ?? 0.0
+        invert = try c.decodeIfPresent(Bool.self, forKey: .invert) ?? false
+        blurBackground = try c.decodeIfPresent(Double.self, forKey: .blurBackground) ?? 0.0
+        keyColor = try c.decodeIfPresent(RGBA.self, forKey: .keyColor) ?? RGBA(r: 0.0, g: 0.694, b: 0.251, a: 1.0)
+    }
 
     mutating func clampAll() {
         tolerance = tolerance.clamped(to: 0...1)
         softness = softness.clamped(to: 0...1)
         edgeShift = edgeShift.clamped(to: -1...1)
+        blurBackground = blurBackground.clamped(to: 0...1)
     }
+}
+
+/// Card polish: drop shadow, crisp border stroke, and corner rounding for video/photo/news-card overlays.
+struct ClipStyle: Codable, Hashable {
+    var shadowOpacity: Double = 0.0
+    var shadowRadius: Double = 24.0
+    var shadowOffsetY: Double = 10.0
+    var borderWidth: Double = 0.0
+    var borderColor: RGBA = RGBA(r: 1, g: 1, b: 1, a: 0.35)
+    var cornerRadius: Double = 0.0
+
+    var isDefault: Bool {
+        shadowOpacity <= 1e-4 && borderWidth <= 1e-4 && cornerRadius <= 1e-4
+    }
+    var isIdentity: Bool { isDefault }
+
+    static let cardPolish = ClipStyle(shadowOpacity: 0.68, shadowRadius: 28, shadowOffsetY: 12,
+                                      borderWidth: 2.5, borderColor: RGBA(r: 1, g: 1, b: 1, a: 0.30), cornerRadius: 0.035)
+
+    mutating func clampAll() {
+        shadowOpacity = shadowOpacity.clamped(to: 0...1)
+        shadowRadius = shadowRadius.clamped(to: 0...80)
+        shadowOffsetY = shadowOffsetY.clamped(to: -50...50)
+        borderWidth = borderWidth.clamped(to: 0...24)
+        cornerRadius = cornerRadius.clamped(to: 0...0.5)
+    }
+}
+
+/// CapCut-style animation presets for entry, exit and continuous subtle motion.
+enum MotionPreset: String, Codable, Hashable, CaseIterable {
+    case none, fade, pop, slideUp, slideDown, slideLeft, slideRight, zoomIn, zoomOut, kenBurns, float
+
+    var label: String {
+        switch self {
+        case .none: return "None"
+        case .fade: return "Fade"
+        case .pop: return "Pop"
+        case .slideUp: return "Slide Up"
+        case .slideDown: return "Slide Down"
+        case .slideLeft: return "Slide Left"
+        case .slideRight: return "Slide Right"
+        case .zoomIn: return "Zoom In"
+        case .zoomOut: return "Zoom Out"
+        case .kenBurns: return "Ken Burns"
+        case .float: return "Subtle Float"
+        }
+    }
+
+    static let inOutCases: [MotionPreset] = [.none, .fade, .pop, .slideUp, .slideDown, .slideLeft, .slideRight, .zoomIn, .zoomOut]
+    static let loopCases: [MotionPreset] = [.none, .kenBurns, .float]
+}
+
+struct ClipAnimation: Codable, Hashable {
+    var inPreset: MotionPreset = .none
+    var inDuration: Double = 0.35
+    var outPreset: MotionPreset = .none
+    var outDuration: Double = 0.30
+    var loopPreset: MotionPreset = .none
+
+    var isDefault: Bool { inPreset == .none && outPreset == .none && loopPreset == .none }
+    var isIdentity: Bool { isDefault }
+
+    mutating func clampAll() {
+        inDuration = inDuration.clamped(to: 0.05...3.0)
+        outDuration = outDuration.clamped(to: 0.05...3.0)
+    }
+
+    /// Evaluates animated deltas at clip-local time `t` (`0...duration`).
+    func evaluate(localTime t: Double, duration: Double) -> (dx: Double, dy: Double, scaleMul: Double, rotDelta: Double, opacityMul: Double) {
+        var dx = 0.0, dy = 0.0, scaleMul = 1.0, rotDelta = 0.0, opacityMul = 1.0
+        let dur = max(0.05, duration)
+
+        func easeOutCubic(_ u: Double) -> Double { let x = 1 - u.clamped(to: 0...1); return 1 - x * x * x }
+        func easeOutBack(_ u: Double) -> Double {
+            let x = u.clamped(to: 0...1)
+            let c1 = 1.70158, c3 = c1 + 1
+            return 1 + c3 * pow(x - 1, 3) + c1 * pow(x - 1, 2)
+        }
+
+        if inPreset != .none, inDuration > 0.01 {
+            let u = (t / min(inDuration, dur * 0.5)).clamped(to: 0...1)
+            if u < 1 {
+                let e = easeOutCubic(u)
+                switch inPreset {
+                case .fade: opacityMul *= e
+                case .pop: scaleMul *= max(0.05, easeOutBack(u)); opacityMul *= min(1, u * 2.5)
+                case .slideUp: dy += (1 - e) * 0.22; opacityMul *= min(1, u * 2.2)
+                case .slideDown: dy -= (1 - e) * 0.22; opacityMul *= min(1, u * 2.2)
+                case .slideLeft: dx += (1 - e) * 0.28; opacityMul *= min(1, u * 2.2)
+                case .slideRight: dx -= (1 - e) * 0.28; opacityMul *= min(1, u * 2.2)
+                case .zoomIn: scaleMul *= 0.72 + 0.28 * e; opacityMul *= min(1, u * 2.2)
+                case .zoomOut: scaleMul *= 1.32 - 0.32 * e; opacityMul *= min(1, u * 2.2)
+                default: break
+                }
+            }
+        }
+        if outPreset != .none, outDuration > 0.01 {
+            let rem = dur - t
+            let od = min(outDuration, dur * 0.5)
+            if rem < od {
+                let u = (rem / od).clamped(to: 0...1)
+                let e = easeOutCubic(u)
+                switch outPreset {
+                case .fade: opacityMul *= e
+                case .pop: scaleMul *= 0.65 + 0.35 * e; opacityMul *= e
+                case .slideUp: dy -= (1 - e) * 0.22; opacityMul *= e
+                case .slideDown: dy += (1 - e) * 0.22; opacityMul *= e
+                case .slideLeft: dx -= (1 - e) * 0.28; opacityMul *= e
+                case .slideRight: dx += (1 - e) * 0.28; opacityMul *= e
+                case .zoomIn: scaleMul *= 1.25 - 0.25 * e; opacityMul *= e
+                case .zoomOut: scaleMul *= 0.75 + 0.25 * e; opacityMul *= e
+                default: break
+                }
+            }
+        }
+        switch loopPreset {
+        case .kenBurns:
+            let p = (t / dur).clamped(to: 0...1)
+            scaleMul *= 1.0 + 0.12 * p
+        case .float:
+            dy += sin(t * 2.2) * 0.012
+            rotDelta += sin(t * 1.4) * 0.6
+        default: break
+        }
+        return (dx, dy, scaleMul, rotDelta, opacityMul.clamped(to: 0...1))
+    }
+}
+
+/// Keyframe of a clip's transform at clip-local time `time` (seconds from clip start).
+struct ClipKeyframe: Codable, Hashable, Identifiable {
+    var id = UUID()
+    var time: Double
+    var x: Double = 0
+    var y: Double = 0
+    var scale: Double = 1
+    var rotation: Double = 0
+    var opacity: Double = 1
+
+    static func interpolate(_ keys: [ClipKeyframe], at localTime: Double) -> ClipKeyframe? {
+        guard !keys.isEmpty else { return nil }
+        let sorted = keys.sorted { $0.time < $1.time }
+        if localTime <= sorted[0].time { return sorted[0] }
+        if localTime >= sorted[sorted.count - 1].time { return sorted[sorted.count - 1] }
+        for i in 0..<(sorted.count - 1) {
+            let a = sorted[i], b = sorted[i + 1]
+            if localTime >= a.time, localTime <= b.time {
+                let span = max(1e-6, b.time - a.time)
+                let raw = ((localTime - a.time) / span).clamped(to: 0...1)
+                // Smoothstep ease-in-out between keyframes.
+                let u = raw * raw * (3 - 2 * raw)
+                return ClipKeyframe(
+                    time: localTime,
+                    x: a.x + (b.x - a.x) * u,
+                    y: a.y + (b.y - a.y) * u,
+                    scale: a.scale + (b.scale - a.scale) * u,
+                    rotation: a.rotation + (b.rotation - a.rotation) * u,
+                    opacity: a.opacity + (b.opacity - a.opacity) * u
+                )
+            }
+        }
+        return sorted.last
+    }
+}
+
+/// Animated news headline highlighter marker wiping left-to-right across a clip.
+struct ClipHighlight: Codable, Hashable {
+    var x: Double = 0.5
+    var y: Double = 0.45
+    var width: Double = 0.72
+    var height: Double = 0.08
+    var color: RGBA = RGBA(r: 1.0, g: 0.90, b: 0.15, a: 0.50)
+    var startOffset: Double = 0.15
+    var wipeDuration: Double = 0.55
+
+    mutating func clampAll() {
+        x = x.clamped(to: 0...1)
+        y = y.clamped(to: 0...1)
+        width = width.clamped(to: 0.05...1.0)
+        height = height.clamped(to: 0.02...0.5)
+        startOffset = startOffset.clamped(to: 0...30)
+        wipeDuration = wipeDuration.clamped(to: 0.05...5.0)
+    }
+}
+
+/// Blur or mosaic pixelation zone for censoring sensitive details or faces.
+struct PrivacyBlur: Codable, Hashable {
+    var x: Double = 0.5
+    var y: Double = 0.5
+    var width: Double = 0.28
+    var height: Double = 0.22
+    var pixelate: Bool = false
+    var strength: Double = 0.65
+
+    mutating func clampAll() {
+        x = x.clamped(to: 0...1)
+        y = y.clamped(to: 0...1)
+        width = width.clamped(to: 0.04...1.0)
+        height = height.clamped(to: 0.04...1.0)
+        strength = strength.clamped(to: 0.1...1.0)
+    }
+}
+
+/// Animated broadcast lower-third bar (name/headline + subtitle/role + colored accent).
+struct LowerThird: Codable, Hashable {
+    var title: String = ""
+    var subtitle: String = ""
+    var accentColor: RGBA = RGBA(r: 0.96, g: 0.77, b: 0.26, a: 1)
+    var y: Double = 0.84
 }
 
 /// Scale, position, rotation, opacity, flip, 4-side crop and mask of a clip within the frame.

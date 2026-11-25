@@ -2047,6 +2047,8 @@ enum SelfTest {
         }
         let proOK = await testCropMaskPro(media: media)
         ok = ok && proOK
+        let modernOK = await testModernSuite(media: media)
+        ok = ok && modernOK
         log(ok ? "SELFTEST OK" : "SELFTEST FAIL")
     }
 
@@ -2122,6 +2124,75 @@ enum SelfTest {
 
         let good = compat && clampOK && pixelOK && mcpOK && negHTTP && namesOK && connectOK
         log("CROP_MASK_PRO \(good ? "OK" : "FAIL") compat=\(compat) clamp=\(clampOK) pixel=\(pixelOK) mcp=\(mcpOK) http=\(negHTTP) names=\(namesOK) connect=\(connectOK)")
+        return good
+    }
+
+    @MainActor
+    private static func testModernSuite(media: MediaStore) async -> Bool {
+        // 1. Keyframe interpolation + animation evaluation math.
+        let kfs = [
+            ClipKeyframe(time: 0, x: 0, y: 0, scale: 1.0, rotation: 0, opacity: 1),
+            ClipKeyframe(time: 2, x: 0.2, y: -0.1, scale: 2.0, rotation: 10, opacity: 0.5),
+        ]
+        let mid = ClipKeyframe.interpolate(kfs, at: 1.0)
+        let kfOK = mid != nil && abs((mid?.scale ?? 0) - 1.5) < 0.01 && abs((mid?.x ?? 0) - 0.1) < 0.01
+
+        let anim = ClipAnimation(inPreset: .slideDown, inDuration: 0.4, outPreset: .fade, outDuration: 0.3, loopPreset: .kenBurns)
+        let evStart = anim.evaluate(localTime: 0.0, duration: 2.0)
+        let evMid = anim.evaluate(localTime: 1.0, duration: 2.0)
+        let evEnd = anim.evaluate(localTime: 1.99, duration: 2.0)
+        let animOK = evStart.opacityMul < 0.05 && evMid.scaleMul > 1.02 && evEnd.opacityMul < 0.15
+
+        // 2. Caption presets & Codable backward compatibility.
+        var cap = CaptionStyle()
+        cap.apply(preset: .yellowBox)
+        let ybOK = cap.boxColor != nil && cap.textColor.r > 0.9 && cap.textColor.g > 0.8
+        cap.apply(preset: .tiktokPop)
+        let capOK = ybOK && cap.uppercase == true && cap.shadow == true
+
+        // 3. GPU render check: Card Polish + Animated Highlighter + Privacy Blur + Lower Third.
+        var p = Project()
+        p.width = 400; p.height = 400; p.fps = 30
+        var card = Clip(trackID: p.videoTracks[0].id, kind: .solid, start: 0, duration: 3)
+        card.color = RGBA(r: 1, g: 1, b: 1, a: 1)
+        card.transform = ClipTransform(scale: 0.7)
+        card.style = .cardPolish
+        card.highlight = ClipHighlight(x: 0.5, y: 0.5, width: 0.8, height: 0.2, startOffset: 0, wipeDuration: 0.3)
+        card.privacyBlur = PrivacyBlur(x: 0.2, y: 0.2, width: 0.2, height: 0.2, pixelate: true, strength: 0.8)
+        card.lowerThird = LowerThird(title: "BREAKING", subtitle: "Live")
+        p.clips = [card]
+        var renderOK = false
+        if let inst = CompositionBuilder.buildInstantInstruction(project: p, media: media, renderSize: p.size) {
+            let frame = TimelineCompositor.compose(inst, at: 1.0, output: p.size) { _, _ in nil }
+            if let cg = TimelineCompositor.context.createCGImage(frame, from: CGRect(origin: .zero, size: p.size)) {
+                let rep = NSBitmapImageRep(cgImage: cg)
+                // Center pixel should be yellow-tinted by the highlighter over the white card.
+                let center = rep.colorAt(x: 200, y: 200)?.usingColorSpace(.sRGB)
+                renderOK = (center?.redComponent ?? 0) > 0.85 && (center?.greenComponent ?? 0) > 0.8 && (center?.blueComponent ?? 1) < 0.75
+            }
+        }
+
+        // 4. MCP tools for Card Polish, Animation, Keyframes, Highlighter, Privacy Blur, Lower Third.
+        let m = EditorModel()
+        m.mutate { $0 = p }
+        let draft = MCPDraft.open(p, model: m)
+        defer { draft.close() }
+        _ = try? await MCPTools.call("set_clip_style", ["clip_id": card.id.uuidString, "preset": "cardPolish"], model: m, client: nil, draft: draft)
+        _ = try? await MCPTools.call("set_animation", ["clip_id": card.id.uuidString, "in": "pop", "loop": "float"], model: m, client: nil, draft: draft)
+        _ = try? await MCPTools.call("set_keyframes", ["clip_id": card.id.uuidString, "keyframes": [["time": 0, "scale": 1.0], ["time": 2, "scale": 1.4]]], model: m, client: nil, draft: draft)
+        _ = try? await MCPTools.call("set_highlighter", ["clip_id": card.id.uuidString, "enabled": true, "y": 0.4], model: m, client: nil, draft: draft)
+        _ = try? await MCPTools.call("set_privacy_blur", ["clip_id": card.id.uuidString, "enabled": true, "pixelate": true], model: m, client: nil, draft: draft)
+        _ = try? await MCPTools.call("set_lower_third", ["clip_id": card.id.uuidString, "enabled": true, "title": "TEST"], model: m, client: nil, draft: draft)
+        let updated = draft.project.clip(card.id)
+        let mcpOK = updated?.style != nil
+            && updated?.animation?.inPreset == .pop
+            && updated?.keyframes?.count == 2
+            && abs((updated?.highlight?.y ?? 0) - 0.4) < 0.01
+            && updated?.privacyBlur?.pixelate == true
+            && updated?.lowerThird?.title == "TEST"
+
+        let good = kfOK && animOK && capOK && renderOK && mcpOK
+        log("MODERN_SUITE \(good ? "OK" : "FAIL") kf=\(kfOK) anim=\(animOK) cap=\(capOK) render=\(renderOK) mcp=\(mcpOK)")
         return good
     }
 }

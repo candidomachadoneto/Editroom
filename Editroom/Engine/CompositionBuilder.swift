@@ -1,6 +1,7 @@
 import AVFoundation
 import AppKit
 import CoreImage
+import MediaToolbox
 
 struct BuiltTimeline {
     let composition: AVComposition
@@ -183,6 +184,7 @@ enum CompositionBuilder {
                 var compTrack: AVMutableCompositionTrack?
                 var params: AVMutableAudioMixInputParameters?
                 var cursor = CMTime.zero
+                var enhancedSpans: [(start: Double, end: Double)] = []
                 let trackGain = audible ? dbToLinear(track.gainDB) : 0
                 // Ducking under another track: the level follows that track's sound.
                 let duckSpans: [(start: Double, end: Double)]? = !audible ? nil : track.duckUnder.flatMap { voice in
@@ -217,6 +219,9 @@ enum CompositionBuilder {
                     }
                     guard let ct = compTrack, let p = params, insert(clip, source: src, range: sourceRange, into: ct, cursor: &cursor) else { continue }
                     hash(clip, into: &hasher)
+                    if clip.voiceEnhance == true {
+                        enhancedSpans.append((clip.start, clip.end))
+                    }
 
                     let gain = Float(trackGain * dbToLinear(clip.gainDB))
                     if let spans = duckSpans, !spans.isEmpty {
@@ -244,6 +249,9 @@ enum CompositionBuilder {
                     if fo > .zero {
                         ramp(p, from: end - fo, duration: fo, gain: gain, curve: clip.outCurve, rising: false)
                     }
+                }
+                if !enhancedSpans.isEmpty, let p = params, let tap = VoiceEnhanceTap.make(spans: enhancedSpans) {
+                    p.audioTapProcessor = tap
                 }
             }
         }
@@ -302,6 +310,7 @@ enum CompositionBuilder {
         hasher.combine(clip.freeze)
         hasher.combine(clip.reversed)
         hasher.combine(clip.ramp)
+        hasher.combine(clip.voiceEnhance)
     }
 
     /// Lightweight instruction builder for instant (<5ms) GPU preview re-compositing without
@@ -489,5 +498,171 @@ enum TextRenderer {
         if cache.count > 64 { cache.removeAll() }
         cache[key] = image
         return image
+    }
+}
+
+/// Real-time studio vocal enhancement processor (MTAudioProcessingTap) shared identically
+/// between live AudioStream playback and final Exporter rendering:
+/// 85 Hz High-Pass (removes rumble/AC hum) + 180 Hz warmth shelf + 3.2 kHz vocal presence EQ
+/// + soft-knee broadcast compressor/limiter so dialogue sounds crisp and loud without clipping.
+private enum VoiceEnhanceTap {
+    private struct Biquad {
+        var b0: Float = 1, b1: Float = 0, b2: Float = 0, a1: Float = 0, a2: Float = 0
+        var z1: Float = 0, z2: Float = 0
+
+        mutating func reset() { z1 = 0; z2 = 0 }
+
+        @inline(__always)
+        mutating func process(_ x: Float) -> Float {
+            let y = b0 * x + z1
+            z1 = b1 * x - a1 * y + z2
+            z2 = b2 * x - a2 * y
+            return y
+        }
+
+        static func highPass(fs: Double, freq: Double, q: Double = 0.707) -> Biquad {
+            let w0 = 2 * Double.pi * freq / max(8000, fs)
+            let c = cos(w0), alpha = sin(w0) / (2 * q)
+            let a0 = 1 + alpha
+            return Biquad(
+                b0: Float((1 + c) / 2 / a0),
+                b1: Float(-(1 + c) / a0),
+                b2: Float((1 + c) / 2 / a0),
+                a1: Float((-2 * c) / a0),
+                a2: Float((1 - alpha) / a0)
+            )
+        }
+
+        static func peaking(fs: Double, freq: Double, q: Double, gainDB: Double) -> Biquad {
+            let a = pow(10, gainDB / 40)
+            let w0 = 2 * Double.pi * freq / max(8000, fs)
+            let c = cos(w0), alpha = sin(w0) / (2 * q)
+            let a0 = 1 + alpha / a
+            return Biquad(
+                b0: Float((1 + alpha * a) / a0),
+                b1: Float((-2 * c) / a0),
+                b2: Float((1 - alpha * a) / a0),
+                a1: Float((-2 * c) / a0),
+                a2: Float((1 - alpha / a) / a0)
+            )
+        }
+    }
+
+    private final class Context {
+        let spans: [(start: Double, end: Double)]
+        var sampleRate: Double = 48000
+        var channels: Int = 2
+        var isInterleaved = false
+        var isFloat = true
+        var hpf: [Biquad] = []
+        var warmth: [Biquad] = []
+        var presence: [Biquad] = []
+        var env: Float = 0
+
+        init(spans: [(start: Double, end: Double)]) {
+            self.spans = spans
+        }
+
+        func configure(asbd: AudioStreamBasicDescription) {
+            sampleRate = asbd.mSampleRate > 0 ? asbd.mSampleRate : 48000
+            channels = max(1, Int(asbd.mChannelsPerFrame))
+            isFloat = (asbd.mFormatFlags & kAudioFormatFlagIsFloat) != 0
+            isInterleaved = (asbd.mFormatFlags & kAudioFormatFlagIsNonInterleaved) == 0
+            hpf = (0..<channels).map { _ in .highPass(fs: sampleRate, freq: 85) }
+            warmth = (0..<channels).map { _ in .peaking(fs: sampleRate, freq: 180, q: 0.9, gainDB: 1.5) }
+            presence = (0..<channels).map { _ in .peaking(fs: sampleRate, freq: 3200, q: 1.1, gainDB: 3.4) }
+            env = 0
+        }
+
+        func active(at t: Double) -> Bool {
+            spans.contains { t >= $0.start - 0.02 && t <= $0.end + 0.02 }
+        }
+    }
+
+    static func make(spans: [(start: Double, end: Double)]) -> MTAudioProcessingTap? {
+        let ctx = Context(spans: spans)
+        let retained = Unmanaged.passRetained(ctx).toOpaque()
+        var callbacks = MTAudioProcessingTapCallbacks(
+            version: kMTAudioProcessingTapCallbacksVersion_0,
+            clientInfo: retained,
+            init: { _, clientInfo, tapStorageOut in
+                tapStorageOut.pointee = clientInfo
+            },
+            finalize: { tap in
+                let raw = MTAudioProcessingTapGetStorage(tap)
+                Unmanaged<Context>.fromOpaque(raw).release()
+            },
+            prepare: { tap, _, processingFormat in
+                let ctx = Unmanaged<Context>.fromOpaque(MTAudioProcessingTapGetStorage(tap)).takeUnretainedValue()
+                ctx.configure(asbd: processingFormat.pointee)
+            },
+            unprepare: { _ in },
+            process: { tap, numberFrames, _, bufferListInOut, numberFramesOut, flagsOut in
+                var timeRange = CMTimeRange.zero
+                let status = MTAudioProcessingTapGetSourceAudio(tap, numberFrames, bufferListInOut, flagsOut, &timeRange, numberFramesOut)
+                guard status == noErr, numberFramesOut.pointee > 0 else { return }
+                let ctx = Unmanaged<Context>.fromOpaque(MTAudioProcessingTapGetStorage(tap)).takeUnretainedValue()
+                guard ctx.isFloat else { return }
+                let t = timeRange.start.isValid && !timeRange.start.isIndefinite ? timeRange.start.seconds : 0
+                guard ctx.active(at: t) else { return }
+
+                let frames = Int(numberFramesOut.pointee)
+                let abl = UnsafeMutableAudioBufferListPointer(bufferListInOut)
+                let attack: Float = 0.008
+                let release: Float = 0.0004
+                let thresh: Float = 0.14   // ~ -17 dBFS
+                let makeup: Float = 1.55   // ~ +3.8 dB presence loudness boost
+
+                if ctx.isInterleaved, let buf = abl.first, let ptr = buf.mData?.assumingMemoryBound(to: Float.self) {
+                    let ch = max(1, ctx.channels)
+                    for f in 0..<frames {
+                        var peak: Float = 0
+                        for c in 0..<min(ch, ctx.hpf.count) {
+                            let idx = f * ch + c
+                            var s = ctx.hpf[c].process(ptr[idx])
+                            s = ctx.warmth[c].process(s)
+                            s = ctx.presence[c].process(s)
+                            ptr[idx] = s
+                            peak = max(peak, abs(s))
+                        }
+                        let coeff = peak > ctx.env ? attack : release
+                        ctx.env += coeff * (peak - ctx.env)
+                        let compGain: Float = ctx.env > thresh ? pow(thresh / max(ctx.env, 1e-6), 0.62) : 1.0
+                        let g = compGain * makeup
+                        for c in 0..<min(ch, ctx.hpf.count) {
+                            let idx = f * ch + c
+                            // Soft tanh limiter at ~ -1 dBFS (0.89) prevents any digital clipping.
+                            ptr[idx] = 0.89 * tanhf((ptr[idx] * g) / 0.89)
+                        }
+                    }
+                } else {
+                    let numBufs = min(abl.count, ctx.hpf.count)
+                    guard numBufs > 0 else { return }
+                    for f in 0..<frames {
+                        var peak: Float = 0
+                        for c in 0..<numBufs {
+                            guard let ptr = abl[c].mData?.assumingMemoryBound(to: Float.self) else { continue }
+                            var s = ctx.hpf[c].process(ptr[f])
+                            s = ctx.warmth[c].process(s)
+                            s = ctx.presence[c].process(s)
+                            ptr[f] = s
+                            peak = max(peak, abs(s))
+                        }
+                        let coeff = peak > ctx.env ? attack : release
+                        ctx.env += coeff * (peak - ctx.env)
+                        let compGain: Float = ctx.env > thresh ? pow(thresh / max(ctx.env, 1e-6), 0.62) : 1.0
+                        let g = compGain * makeup
+                        for c in 0..<numBufs {
+                            guard let ptr = abl[c].mData?.assumingMemoryBound(to: Float.self) else { continue }
+                            ptr[f] = 0.89 * tanhf((ptr[f] * g) / 0.89)
+                        }
+                    }
+                }
+            }
+        )
+        var tap: MTAudioProcessingTap?
+        let err = MTAudioProcessingTapCreate(kCFAllocatorDefault, &callbacks, kMTAudioProcessingTapCreationFlag_PreEffects, &tap)
+        guard err == noErr, let created = tap else { return nil }
+        return created
     }
 }

@@ -280,15 +280,15 @@ struct PreviewView: View {
                 directManipulationOverlay(for: c, canvasSize: canvasSize)
             }
 
-            // Live numeric HUD pill while dragging/scaling/cropping/rotating.
-            if let hud = hudText {
+            // Live numeric HUD pill while dragging/scaling/cropping/rotating, or transient action toast.
+            if let hud = hudText ?? model.statusToast {
                 Text(hud)
                     .font(Theme.mono(11, .semibold))
                     .foregroundStyle(Color.white)
                     .padding(.horizontal, 10)
                     .padding(.vertical, 5)
-                    .background(Capsule().fill(Color.black.opacity(0.78)))
-                    .overlay(Capsule().strokeBorder(Color(hex: 0x38BDF8).opacity(0.6), lineWidth: 1))
+                    .background(Capsule().fill(Color.black.opacity(0.82)))
+                    .overlay(Capsule().strokeBorder(Color(hex: 0x38BDF8).opacity(0.65), lineWidth: 1))
                     .position(x: w / 2, y: 22)
                     .allowsHitTesting(false)
             }
@@ -772,6 +772,17 @@ private struct CanvasQuickBar: View {
                     }
                     AppleHaptics.click()
                 }
+                let polished = clip.style != nil
+                quickBtn(symbol: "sparkles.rectangle.stack", label: "Polish", active: polished) {
+                    model.mutate { p in
+                        guard let i = p.index(of: clip.id) else { return }
+                        p.clips[i].style = polished ? nil : .cardPolish
+                    }
+                    AppleHaptics.click()
+                }
+                quickBtn(symbol: "faceid", label: "Face Track", active: false) {
+                    Task { await model.autoReframeFaces(clipIDs: [clip.id]) }
+                }
             }
             quickBtn(symbol: "arrow.left.and.right.righttriangle.left.righttriangle.right", label: "Flip H", active: tf.flipH) {
                 apply { $0.flipH.toggle() }
@@ -893,6 +904,9 @@ struct TransportBar: View {
                 .menuIndicator(.hidden)
                 .fixedSize()
                 .help("Viewer zoom")
+                IconButton(symbol: "camera", size: 28, help: "Export Current Frame as PNG") {
+                    Task { await model.snapshotCurrentFrame() }
+                }
                 IconButton(symbol: model.viewerOnly ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right",
                            size: 28, help: model.viewerOnly ? "Exit Full Screen (F or Esc)" : "Full Screen Viewer (F)") {
                     model.toggleViewerFullScreen()
