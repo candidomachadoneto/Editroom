@@ -79,7 +79,7 @@ struct PreviewView: View {
         var bottomEdge = false
     }
 
-    private enum CanvasHandle: Equatable {
+    fileprivate enum CanvasHandle: Equatable {
         case body
         case topLeft, topRight, bottomLeft, bottomRight
         case cropLeft, cropRight, cropTop, cropBottom
@@ -95,6 +95,8 @@ struct PreviewView: View {
         let startPoint: CGPoint
         let startAngle: Double
     }
+
+    @State private var hoveredHandle: CanvasHandle?
 
     init(model: EditorModel) {
         self.model = model
@@ -413,63 +415,101 @@ struct PreviewView: View {
             edgeHandle(clip: clip, handle: .cropRight, at: rightMid, angleDeg: tf.rotation, horizontal: false, canvasSize: canvasSize)
 
             // 4 Corner Scale Handles.
-            cornerHandle(clip: clip, handle: .topLeft, at: tl, canvasSize: canvasSize)
-            cornerHandle(clip: clip, handle: .topRight, at: tr, canvasSize: canvasSize)
-            cornerHandle(clip: clip, handle: .bottomLeft, at: bl, canvasSize: canvasSize)
-            cornerHandle(clip: clip, handle: .bottomRight, at: brPt, canvasSize: canvasSize)
+            cornerHandle(clip: clip, handle: .topLeft, at: tl, rotationDeg: tf.rotation, canvasSize: canvasSize)
+            cornerHandle(clip: clip, handle: .topRight, at: tr, rotationDeg: tf.rotation, canvasSize: canvasSize)
+            cornerHandle(clip: clip, handle: .bottomLeft, at: bl, rotationDeg: tf.rotation, canvasSize: canvasSize)
+            cornerHandle(clip: clip, handle: .bottomRight, at: brPt, rotationDeg: tf.rotation, canvasSize: canvasSize)
 
             // Top Rotation Handle.
+            let rotHot = hoveredHandle == .rotate || canvasDrag?.handle == .rotate
             Circle()
                 .fill(Color.white)
                 .overlay(Circle().strokeBorder(Color(hex: 0x38BDF8), lineWidth: 1.5))
                 .overlay(Image(systemName: "arrow.triangle.2.circlepath").font(.system(size: 8.5, weight: .bold)).foregroundStyle(Color.black))
                 .frame(width: 18, height: 18)
+                .scaleEffect(rotHot ? 1.18 : 1)
+                .animation(.easeOut(duration: 0.1), value: rotHot)
                 .shadow(color: .black.opacity(0.45), radius: 2)
                 .frame(width: 28, height: 28)
                 .contentShape(Circle())
                 .position(rotHandle)
+                .onHover { hovering in
+                    updateHandleHover(.rotate, hovering: hovering, rotationDeg: tf.rotation)
+                }
                 .onTapGesture {}
                 .gesture(
                     DragGesture(minimumDistance: 1, coordinateSpace: .named("viewer"))
-                        .onChanged { v in handleTransformDrag(clip: clip, handle: .rotate, value: v, canvasSize: canvasSize) }
+                        .onChanged { v in
+                            CanvasCursors.rotate.set()
+                            handleTransformDrag(clip: clip, handle: .rotate, value: v, canvasSize: canvasSize)
+                        }
                         .onEnded { _ in endCanvasDrag() }
                 )
         }
         .frame(width: canvasSize.width, height: canvasSize.height, alignment: .topLeading)
     }
 
-    private func cornerHandle(clip: Clip, handle: CanvasHandle, at point: CGPoint, canvasSize: CGSize) -> some View {
-        Circle()
+    private func updateHandleHover(_ handle: CanvasHandle, hovering: Bool, rotationDeg: Double) {
+        if hovering {
+            hoveredHandle = handle
+            CanvasCursors.cursor(for: handle, rotationDeg: rotationDeg).set()
+        } else if hoveredHandle == handle {
+            hoveredHandle = nil
+            if canvasDrag == nil { NSCursor.arrow.set() }
+        }
+    }
+
+    private func cornerHandle(clip: Clip, handle: CanvasHandle, at point: CGPoint, rotationDeg: Double, canvasSize: CGSize) -> some View {
+        let hot = hoveredHandle == handle || canvasDrag?.handle == handle
+        return Circle()
             .fill(Color.white)
             .overlay(Circle().strokeBorder(Color(hex: 0x38BDF8), lineWidth: 1.5))
-            .frame(width: 11, height: 11)
+            .frame(width: 12, height: 12)
+            .scaleEffect(hot ? 1.25 : 1)
+            .animation(.easeOut(duration: 0.1), value: hot)
             .shadow(color: .black.opacity(0.45), radius: 2)
-            .frame(width: 26, height: 26)
+            .frame(width: 28, height: 28)
             .contentShape(Rectangle())
             .position(point)
+            .help("Drag corner to resize")
+            .onHover { hovering in
+                updateHandleHover(handle, hovering: hovering, rotationDeg: rotationDeg)
+            }
             .onTapGesture {}
             .gesture(
                 DragGesture(minimumDistance: 1, coordinateSpace: .named("viewer"))
-                    .onChanged { v in handleTransformDrag(clip: clip, handle: handle, value: v, canvasSize: canvasSize) }
+                    .onChanged { v in
+                        CanvasCursors.cursor(for: handle, rotationDeg: rotationDeg).set()
+                        handleTransformDrag(clip: clip, handle: handle, value: v, canvasSize: canvasSize)
+                    }
                     .onEnded { _ in endCanvasDrag() }
             )
     }
 
     private func edgeHandle(clip: Clip, handle: CanvasHandle, at point: CGPoint, angleDeg: Double, horizontal: Bool, canvasSize: CGSize) -> some View {
-        Capsule()
+        let hot = hoveredHandle == handle || canvasDrag?.handle == handle
+        return Capsule()
             .fill(Color(hex: 0xF5C542))
             .overlay(Capsule().strokeBorder(Color.black.opacity(0.7), lineWidth: 1))
             .frame(width: horizontal ? 24 : 6, height: horizontal ? 6 : 24)
             .rotationEffect(.degrees(angleDeg))
+            .scaleEffect(hot ? 1.2 : 1)
+            .animation(.easeOut(duration: 0.1), value: hot)
             .shadow(color: .black.opacity(0.45), radius: 2)
             .frame(width: 28, height: 28)
             .contentShape(Rectangle())
             .position(point)
             .help("Drag edge to crop")
+            .onHover { hovering in
+                updateHandleHover(handle, hovering: hovering, rotationDeg: angleDeg)
+            }
             .onTapGesture {}
             .gesture(
                 DragGesture(minimumDistance: 1, coordinateSpace: .named("viewer"))
-                    .onChanged { v in handleTransformDrag(clip: clip, handle: handle, value: v, canvasSize: canvasSize) }
+                    .onChanged { v in
+                        CanvasCursors.cursor(for: handle, rotationDeg: angleDeg).set()
+                        handleTransformDrag(clip: clip, handle: handle, value: v, canvasSize: canvasSize)
+                    }
                     .onEnded { _ in endCanvasDrag() }
             )
     }
@@ -479,6 +519,11 @@ struct PreviewView: View {
         moveStart = nil
         guides = SnapGuides()
         hudText = nil
+        if let h = hoveredHandle, let c = activeTarget {
+            CanvasCursors.cursor(for: h, rotationDeg: c.transform?.rotation ?? 0).set()
+        } else {
+            NSCursor.arrow.set()
+        }
         model.commitLive()
     }
 
@@ -910,4 +955,96 @@ private struct PlayButton: View {
         .animation(.easeOut(duration: 0.12), value: hovering)
         .help("Play / Pause (Space)")
     }
+}
+
+/// Crisp native-style double-headed diagonal, vertical, horizontal, and rotation cursors
+/// for direct manipulation on the preview canvas (automatically rotated with the clip).
+@MainActor
+private enum CanvasCursors {
+    private static var cache: [Int: NSCursor] = [:]
+
+    static func cursor(for handle: PreviewView.CanvasHandle, rotationDeg: Double) -> NSCursor {
+        switch handle {
+        case .body:
+            return .openHand
+        case .rotate:
+            return rotate
+        case .topLeft, .bottomRight:
+            return resize(angleDeg: 135 - rotationDeg)
+        case .topRight, .bottomLeft:
+            return resize(angleDeg: 45 - rotationDeg)
+        case .cropTop, .cropBottom:
+            return resize(angleDeg: 90 - rotationDeg)
+        case .cropLeft, .cropRight:
+            return resize(angleDeg: -rotationDeg)
+        }
+    }
+
+    /// Double-headed arrow cursor at any angle (quantized to 15° steps and cached).
+    /// `0°` = horizontal ↔, `45°` = diagonal ↗↙, `90°` = vertical ↕, `135°` = diagonal ↖↘.
+    static func resize(angleDeg: Double) -> NSCursor {
+        let norm = ((angleDeg.truncatingRemainder(dividingBy: 180)) + 180).truncatingRemainder(dividingBy: 180)
+        let bucket = (Int((norm / 15).rounded()) * 15) % 180
+        if let hit = cache[bucket] { return hit }
+
+        let size = NSSize(width: 24, height: 24)
+        let image = NSImage(size: size, flipped: false) { rect in
+            guard let ctx = NSGraphicsContext.current?.cgContext else { return false }
+            ctx.saveGState()
+            ctx.translateBy(x: rect.midX, y: rect.midY)
+            ctx.rotate(by: CGFloat(bucket) * .pi / 180)
+
+            // Double-headed arrow along the X axis (-9...+9), black fill with crisp white outline.
+            let p = CGMutablePath()
+            p.move(to: CGPoint(x: -9.0, y: 0))
+            p.addLine(to: CGPoint(x: -4.2, y: 4.5))
+            p.addLine(to: CGPoint(x: -4.2, y: 1.5))
+            p.addLine(to: CGPoint(x: 4.2, y: 1.5))
+            p.addLine(to: CGPoint(x: 4.2, y: 4.5))
+            p.addLine(to: CGPoint(x: 9.0, y: 0))
+            p.addLine(to: CGPoint(x: 4.2, y: -4.5))
+            p.addLine(to: CGPoint(x: 4.2, y: -1.5))
+            p.addLine(to: CGPoint(x: -4.2, y: -1.5))
+            p.addLine(to: CGPoint(x: -4.2, y: -4.5))
+            p.closeSubpath()
+
+            ctx.setShadow(offset: CGSize(width: 0, height: -0.8), blur: 1.5, color: NSColor.black.withAlphaComponent(0.35).cgColor)
+            ctx.addPath(p)
+            ctx.setStrokeColor(NSColor.white.cgColor)
+            ctx.setLineWidth(2.4)
+            ctx.setLineJoin(.round)
+            ctx.strokePath()
+
+            ctx.setShadow(offset: .zero, blur: 0, color: nil)
+            ctx.addPath(p)
+            ctx.setFillColor(NSColor.black.cgColor)
+            ctx.fillPath()
+
+            ctx.restoreGState()
+            return true
+        }
+        let cursor = NSCursor(image: image, hotSpot: NSPoint(x: 12, y: 12))
+        cache[bucket] = cursor
+        return cursor
+    }
+
+    static let rotate: NSCursor = {
+        let size = NSSize(width: 24, height: 24)
+        let image = NSImage(size: size, flipped: false) { rect in
+            let cfg = NSImage.SymbolConfiguration(pointSize: 14, weight: .bold)
+                .applying(NSImage.SymbolConfiguration(paletteColors: [.black]))
+            guard let sym = NSImage(systemSymbolName: "arrow.triangle.2.circlepath", accessibilityDescription: nil)?
+                .withSymbolConfiguration(cfg),
+                  let whiteCfg = Optional(NSImage.SymbolConfiguration(pointSize: 15, weight: .black)
+                    .applying(NSImage.SymbolConfiguration(paletteColors: [.white]))),
+                  let halo = NSImage(systemSymbolName: "arrow.triangle.2.circlepath", accessibilityDescription: nil)?
+                    .withSymbolConfiguration(whiteCfg) else { return false }
+            let hs = halo.size
+            halo.draw(in: NSRect(x: rect.midX - hs.width / 2, y: rect.midY - hs.height / 2, width: hs.width, height: hs.height))
+            let s = sym.size
+            sym.draw(in: NSRect(x: rect.midX - s.width / 2, y: rect.midY - s.height / 2, width: s.width, height: s.height))
+            return true
+        }
+        return NSCursor(image: image, hotSpot: NSPoint(x: 12, y: 12))
+    }()
 }
