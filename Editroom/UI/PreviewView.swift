@@ -65,6 +65,8 @@ struct PreviewView: View {
     @State private var zoom: Double?
     /// Active interactive handle on the selected clip's canvas bounding box.
     @State private var canvasDrag: CanvasDragState?
+    /// Active multi-layer group move/scale state (Photoshop-style Shift/Cmd multi-select).
+    @State private var groupDrag: GroupDragState?
     /// Magnetic guide lines flashed while dragging/rotating on the canvas.
     @State private var guides = SnapGuides()
     /// Live HUD badge shown while dragging/scaling/cropping/rotating on the canvas.
@@ -96,6 +98,14 @@ struct PreviewView: View {
         let startAngle: Double
     }
 
+    private struct GroupDragState {
+        let handle: CanvasHandle
+        let startPoint: CGPoint
+        let groupRect: CGRect
+        let transforms: [UUID: ClipTransform]
+        let texts: [UUID: (x: Double, y: Double, size: Double)]
+    }
+
     @State private var hoveredHandle: CanvasHandle?
     @State private var lastSnapScale100 = false
     @State private var lastSnapAngle: Double?
@@ -108,19 +118,56 @@ struct PreviewView: View {
         self.source = model.sourcePreview
     }
 
-    /// The one visual clip in the selection, which dragging in the viewer moves/crops/scales/rotates.
+    /// All visual clips currently selected, visible at the playhead, and on unlocked/visible tracks.
+    private var activeTargets: [Clip] {
+        let t = Double(clock.frame) / max(1, model.project.fps)
+        return model.project.clips.filter { c in
+            guard model.selection.contains(c.id), c.kind != .audio else { return false }
+            guard t >= c.start - 1e-4 && t < c.end - 1e-4 else { return false }
+            if let track = model.project.videoTracks.first(where: { $0.id == c.trackID }), track.hidden || track.locked { return false }
+            return true
+        }
+    }
+
+    /// The one visual clip in the selection, when exactly one is selected.
     private var target: Clip? {
         let visual = model.selection.compactMap { model.project.clip($0) }.filter { $0.kind != .audio }
         return visual.count == 1 ? visual[0] : nil
     }
 
-    /// Whether the selected target clip is actually visible and unlocked at the current playhead time.
+    /// Whether the single selected target clip is actually visible and unlocked at the current playhead time.
     private var activeTarget: Clip? {
-        guard let c = target else { return nil }
-        let t = Double(clock.frame) / max(1, model.project.fps)
-        guard t >= c.start - 1e-4 && t < c.end - 1e-4 else { return nil }
-        if let track = model.project.videoTracks.first(where: { $0.id == c.trackID }), track.hidden || track.locked { return nil }
-        return c
+        let list = activeTargets
+        return list.count == 1 ? list[0] : nil
+    }
+
+    private func isMultiSelectKeyDown() -> Bool {
+        let flags = NSEvent.modifierFlags
+        return flags.contains(.shift) || flags.contains(.command)
+    }
+
+    /// Bounding rectangle of any visual clip in viewer coordinates (`yUp: false`).
+    private func visualBounds(of clip: Clip, in canvas: CGSize) -> CGRect {
+        if clip.kind == .text {
+            let cx = CGFloat(clip.text.x) * canvas.width
+            let cy = CGFloat(clip.text.y) * canvas.height
+            let h = max(32, CGFloat(clip.text.size) * min(canvas.width, canvas.height) / 1080 * 1.4)
+            let w = min(canvas.width * 0.85, max(100, CGFloat(max(4, clip.text.string.count)) * h * 0.42))
+            return CGRect(x: cx - w / 2, y: cy - h / 2, width: w, height: h)
+        }
+        let tf = clip.transform ?? ClipTransform()
+        let br = baseRect(for: clip, in: canvas)
+        let cr = tf.croppedRect(in: br, yUp: false)
+        let m = tf.affine(canvasSize: canvas, yUp: false)
+        let pts = [
+            CGPoint(x: cr.minX, y: cr.minY).applying(m),
+            CGPoint(x: cr.maxX, y: cr.minY).applying(m),
+            CGPoint(x: cr.maxX, y: cr.maxY).applying(m),
+            CGPoint(x: cr.minX, y: cr.maxY).applying(m),
+        ]
+        let minX = pts.map(\.x).min() ?? 0, maxX = pts.map(\.x).max() ?? 0
+        let minY = pts.map(\.y).min() ?? 0, maxY = pts.map(\.y).max() ?? 0
+        return CGRect(x: minX, y: minY, width: max(4, maxX - minX), height: max(4, maxY - minY))
     }
 
     private func baseRect(for clip: Clip, in canvas: CGSize) -> CGRect {
@@ -169,11 +216,12 @@ struct PreviewView: View {
     var body: some View {
         VStack(spacing: 0) {
             ZStack {
-                // Clicking anywhere outside the video frame (margins/backdrop) clears the selection.
+                // Clicking anywhere outside the video frame (margins/backdrop) clears the selection
+                // unless Shift or Command is held (Photoshop multi-select convention).
                 Color.clear
                     .contentShape(Rectangle())
                     .onTapGesture {
-                        if !model.selection.isEmpty { model.selection = [] }
+                        if !isMultiSelectKeyDown(), !model.selection.isEmpty { model.selection = [] }
                     }
 
                 GeometryReader { geo in
@@ -189,7 +237,7 @@ struct PreviewView: View {
                             Color.clear
                                 .contentShape(Rectangle())
                                 .onTapGesture {
-                                    if !model.selection.isEmpty { model.selection = [] }
+                                    if !isMultiSelectKeyDown(), !model.selection.isEmpty { model.selection = [] }
                                 }
                             viewer.position(x: geo.size.width / 2, y: geo.size.height / 2)
                         }
@@ -199,7 +247,7 @@ struct PreviewView: View {
                                 Color.clear
                                     .contentShape(Rectangle())
                                     .onTapGesture {
-                                        if !model.selection.isEmpty { model.selection = [] }
+                                        if !isMultiSelectKeyDown(), !model.selection.isEmpty { model.selection = [] }
                                     }
                                 viewer
                             }
@@ -219,11 +267,18 @@ struct PreviewView: View {
                 )
             )
 
-            // CapCut-style quick canvas bar when a visual transformable clip is selected.
-            if let clip = activeTarget, clip.isTransformable, !model.viewerOnly {
-                CanvasQuickBar(clip: clip, model: model)
-                    .padding(.top, 6)
-                    .padding(.horizontal, 16)
+            // CapCut/Photoshop-style quick canvas bar for single OR multi-selected visual layers.
+            if !model.viewerOnly {
+                let selectedVis = activeTargets
+                if selectedVis.count > 1 {
+                    MultiCanvasQuickBar(clips: selectedVis, model: model)
+                        .padding(.top, 6)
+                        .padding(.horizontal, 16)
+                } else if let clip = selectedVis.first, clip.isTransformable {
+                    CanvasQuickBar(clip: clip, model: model)
+                        .padding(.top, 6)
+                        .padding(.horizontal, 16)
+                }
             }
 
             // The bar takes the whole space under the picture, so its controls sit in the middle of it.
@@ -234,7 +289,8 @@ struct PreviewView: View {
 
     @ViewBuilder private func picture(w: CGFloat, h: CGFloat) -> some View {
         let canvasSize = CGSize(width: max(1, w), height: max(1, h))
-        let clip = activeTarget
+        let targets = activeTargets
+        let clip = targets.count == 1 ? targets[0] : nil
         ZStack(alignment: .topLeading) {
             PreviewSurfaceView(model: model)
                 .frame(width: w, height: h)
@@ -275,9 +331,20 @@ struct PreviewView: View {
                 .allowsHitTesting(false)
             }
 
-            // CapCut-style direct-manipulation bounding box + 4 crop edges + 4 scale corners + rotation handle.
-            if let c = clip, c.isTransformable, !model.isPlaying, source.current == nil, !model.viewerOnly {
-                directManipulationOverlay(for: c, canvasSize: canvasSize)
+            // CapCut/Photoshop direct-manipulation overlay: single-layer crop/scale/rotate OR multi-layer group bounding box.
+            if !model.isPlaying, source.current == nil, !model.viewerOnly {
+                if targets.count > 1 {
+                    multiSelectionOverlay(for: targets, canvasSize: canvasSize)
+                } else if let c = clip, c.isTransformable {
+                    directManipulationOverlay(for: c, canvasSize: canvasSize)
+                } else if let c = clip, c.kind == .text {
+                    let r = visualBounds(of: c, in: canvasSize)
+                    Rectangle()
+                        .strokeBorder(Color(hex: 0x38BDF8), style: StrokeStyle(lineWidth: 1.4, dash: [4, 3]))
+                        .frame(width: r.width, height: r.height)
+                        .position(x: r.midX, y: r.midY)
+                        .allowsHitTesting(false)
+                }
             }
 
             // Live numeric HUD pill while dragging/scaling/cropping/rotating, or transient action toast.
@@ -309,22 +376,41 @@ struct PreviewView: View {
         .contentShape(Rectangle())
         .onTapGesture { loc in
             guard !model.project.clips.isEmpty, source.current == nil else { return }
+            let multi = isMultiSelectKeyDown()
             if let hit = hitTestClip(at: loc, in: canvasSize) {
-                model.selection = [hit.id]
-            } else {
+                if multi {
+                    if model.selection.contains(hit.id) {
+                        model.selection.remove(hit.id)
+                    } else {
+                        model.selection.insert(hit.id)
+                    }
+                    AppleHaptics.tick()
+                } else {
+                    model.selection = [hit.id]
+                }
+            } else if !multi {
                 model.selection = []
             }
         }
         .gesture(
             DragGesture(minimumDistance: 2, coordinateSpace: .named("viewer"))
                 .onChanged { v in
-                    // Auto-select clip under drag start if nothing (or a different clip) is selected.
-                    if canvasDrag == nil, moveStart == nil, let hit = hitTestClip(at: v.startLocation, in: canvasSize) {
+                    // Auto-select clip under drag start if it isn't already in the current selection.
+                    if canvasDrag == nil, groupDrag == nil, moveStart == nil, let hit = hitTestClip(at: v.startLocation, in: canvasSize) {
                         if !model.selection.contains(hit.id) {
-                            model.selection = [hit.id]
+                            if isMultiSelectKeyDown() {
+                                model.selection.insert(hit.id)
+                            } else {
+                                model.selection = [hit.id]
+                            }
                         }
                     }
-                    guard let c = activeTarget else { return }
+                    let currentTargets = activeTargets
+                    if currentTargets.count > 1 {
+                        handleGroupDrag(clips: currentTargets, handle: .body, value: v, canvasSize: canvasSize)
+                        return
+                    }
+                    guard let c = currentTargets.first else { return }
                     if c.kind == .text {
                         if moveStart == nil { moveStart = (c.text.x, c.text.y) }
                         guard let s = moveStart else { return }
@@ -356,8 +442,182 @@ struct PreviewView: View {
     }
 
     private func cancelCanvasDragIfActive() {
-        guard canvasDrag != nil || moveStart != nil || hudText != nil || guides != SnapGuides() else { return }
+        guard canvasDrag != nil || groupDrag != nil || moveStart != nil || hudText != nil || guides != SnapGuides() else { return }
         endCanvasDrag()
+    }
+
+    /// Photoshop-style multi-layer selection overlay: individual layer outlines + combined group bounding box
+    /// with 4 diagonal corner handles to scale the entire selected group proportionally.
+    @ViewBuilder
+    private func multiSelectionOverlay(for clips: [Clip], canvasSize: CGSize) -> some View {
+        let rects = clips.map { visualBounds(of: $0, in: canvasSize) }
+        let unionRect = rects.dropFirst().reduce(rects.first ?? .zero) { $0.union($1) }
+        let tl = CGPoint(x: unionRect.minX, y: unionRect.minY)
+        let tr = CGPoint(x: unionRect.maxX, y: unionRect.minY)
+        let bl = CGPoint(x: unionRect.minX, y: unionRect.maxY)
+        let br = CGPoint(x: unionRect.maxX, y: unionRect.maxY)
+
+        ZStack(alignment: .topLeading) {
+            Canvas { ctx, _ in
+                // Individual dashed cyan outlines for every selected layer.
+                for r in rects {
+                    ctx.stroke(Path(r), with: .color(Color(hex: 0x38BDF8).opacity(0.65)),
+                               style: StrokeStyle(lineWidth: 1, dash: [4, 3]))
+                }
+                // Combined outer group bounding box in vivid gold-cyan.
+                ctx.stroke(Path(unionRect), with: .color(Color(hex: 0x38BDF8)), lineWidth: 1.6)
+            }
+            .frame(width: canvasSize.width, height: canvasSize.height)
+            .allowsHitTesting(false)
+
+            // Compact layer-count badge on top-left corner of the group box.
+            Text("\(clips.count) layers")
+                .font(Theme.mono(9.5, .bold))
+                .foregroundStyle(Color.black)
+                .padding(.horizontal, 6)
+                .padding(.vertical, 2)
+                .background(Capsule().fill(Color(hex: 0xF5C542)))
+                .position(x: min(max(36, unionRect.minX + 34), canvasSize.width - 36),
+                          y: max(12, unionRect.minY - 11))
+                .allowsHitTesting(false)
+
+            // 4 Diagonal Corner Scale Handles for the whole group (Photoshop Free Transform).
+            groupCornerHandle(clips: clips, handle: .topLeft, at: tl, canvasSize: canvasSize)
+            groupCornerHandle(clips: clips, handle: .topRight, at: tr, canvasSize: canvasSize)
+            groupCornerHandle(clips: clips, handle: .bottomLeft, at: bl, canvasSize: canvasSize)
+            groupCornerHandle(clips: clips, handle: .bottomRight, at: br, canvasSize: canvasSize)
+        }
+        .frame(width: canvasSize.width, height: canvasSize.height, alignment: .topLeading)
+    }
+
+    private func groupCornerHandle(clips: [Clip], handle: CanvasHandle, at point: CGPoint, canvasSize: CGSize) -> some View {
+        let hot = hoveredHandle == handle || groupDrag?.handle == handle
+        return Circle()
+            .fill(Color(hex: 0xF5C542))
+            .overlay(Circle().strokeBorder(Color.black.opacity(0.85), lineWidth: 1.5))
+            .frame(width: 12, height: 12)
+            .scaleEffect(hot ? 1.25 : 1)
+            .animation(.easeOut(duration: 0.1), value: hot)
+            .shadow(color: .black.opacity(0.45), radius: 2)
+            .frame(width: 28, height: 28)
+            .contentShape(Rectangle())
+            .position(point)
+            .help("Drag corner to scale all \(clips.count) selected layers together")
+            .onHover { hovering in
+                updateHandleHover(handle, hovering: hovering, rotationDeg: 0)
+            }
+            .onTapGesture {}
+            .gesture(
+                DragGesture(minimumDistance: 1, coordinateSpace: .named("viewer"))
+                    .onChanged { v in
+                        CanvasCursors.cursor(for: handle, rotationDeg: 0).set()
+                        handleGroupDrag(clips: clips, handle: handle, value: v, canvasSize: canvasSize)
+                    }
+                    .onEnded { _ in endCanvasDrag() }
+            )
+    }
+
+    private func handleGroupDrag(clips: [Clip], handle: CanvasHandle, value: DragGesture.Value, canvasSize: CGSize) {
+        if groupDrag == nil || groupDrag?.handle != handle {
+            var transforms: [UUID: ClipTransform] = [:]
+            var texts: [UUID: (x: Double, y: Double, size: Double)] = [:]
+            var unionRect: CGRect?
+            for c in clips {
+                if c.kind == .text {
+                    texts[c.id] = (c.text.x, c.text.y, c.text.size)
+                } else if c.isTransformable {
+                    transforms[c.id] = c.transform ?? ClipTransform()
+                }
+                let r = visualBounds(of: c, in: canvasSize)
+                unionRect = unionRect.map { $0.union(r) } ?? r
+            }
+            groupDrag = GroupDragState(handle: handle, startPoint: value.startLocation,
+                                       groupRect: unionRect ?? .zero, transforms: transforms, texts: texts)
+        }
+        guard let st = groupDrag else { return }
+        let w = Double(canvasSize.width), h = Double(canvasSize.height)
+        guard w > 0, h > 0 else { return }
+
+        switch handle {
+        case .body:
+            var dx = Double(value.translation.width) / w
+            var dy = Double(value.translation.height) / h
+            var g = SnapGuides()
+            let snapPx = 6.0
+            let movedCenterX = st.groupRect.midX + CGFloat(dx * w)
+            let movedCenterY = st.groupRect.midY + CGFloat(dy * h)
+            if abs(movedCenterX - canvasSize.width / 2) < snapPx {
+                dx = Double(canvasSize.width / 2 - st.groupRect.midX) / w; g.centerX = true
+            }
+            if abs(movedCenterY - canvasSize.height / 2) < snapPx {
+                dy = Double(canvasSize.height / 2 - st.groupRect.midY) / h; g.centerY = true
+            }
+            let movedMinX = st.groupRect.minX + CGFloat(dx * w)
+            let movedMaxX = st.groupRect.maxX + CGFloat(dx * w)
+            let movedMinY = st.groupRect.minY + CGFloat(dy * h)
+            let movedMaxY = st.groupRect.maxY + CGFloat(dy * h)
+            if abs(movedMinX) < snapPx { dx = Double(-st.groupRect.minX) / w; g.leftEdge = true }
+            else if abs(movedMaxX - canvasSize.width) < snapPx { dx = Double(canvasSize.width - st.groupRect.maxX) / w; g.rightEdge = true }
+            if abs(movedMinY) < snapPx { dy = Double(-st.groupRect.minY) / h; g.topEdge = true }
+            else if abs(movedMaxY - canvasSize.height) < snapPx { dy = Double(canvasSize.height - st.groupRect.maxY) / h; g.bottomEdge = true }
+            if (g.centerX && !guides.centerX) || (g.centerY && !guides.centerY)
+                || (g.leftEdge && !guides.leftEdge) || (g.rightEdge && !guides.rightEdge)
+                || (g.topEdge && !guides.topEdge) || (g.bottomEdge && !guides.bottomEdge) {
+                AppleHaptics.align()
+            }
+            guides = g
+            hudText = String(format: "Move %d layers (%+.0f, %+.0f)", clips.count, dx * Double(model.project.width), dy * Double(model.project.height))
+            model.liveVisual(autoCommit: false) { p in
+                for (id, orig) in st.transforms {
+                    guard let i = p.index(of: id) else { continue }
+                    var t = orig
+                    t.x = orig.x + dx
+                    t.y = orig.y + dy
+                    t.clampAll()
+                    p.clips[i].transform = t.isIdentity ? nil : t
+                }
+                for (id, orig) in st.texts {
+                    guard let i = p.index(of: id) else { continue }
+                    p.clips[i].text.x = (orig.x + dx).clamped(to: 0...1)
+                    p.clips[i].text.y = (orig.y + dy).clamped(to: 0...1)
+                }
+            }
+
+        case .topLeft, .topRight, .bottomLeft, .bottomRight:
+            let pivot = CGPoint(x: st.groupRect.midX, y: st.groupRect.midY)
+            let d0 = max(12, hypot(st.startPoint.x - pivot.x, st.startPoint.y - pivot.y))
+            let d1 = max(6, hypot(value.location.x - pivot.x, value.location.y - pivot.y))
+            var factor = Double(d1 / d0).clamped(to: 0.1...8.0)
+            let snapped = abs(factor - 1.0) < 0.025
+            if snapped { factor = 1.0 }
+            if snapped && !lastSnapScale100 { AppleHaptics.align() }
+            lastSnapScale100 = snapped
+            let pivotNormX = Double(pivot.x / canvasSize.width) - 0.5
+            let pivotNormY = Double(pivot.y / canvasSize.height) - 0.5
+            guides = SnapGuides()
+            hudText = String(format: "Scale %d layers · %.0f%%", clips.count, factor * 100)
+            model.liveVisual(autoCommit: false) { p in
+                for (id, orig) in st.transforms {
+                    guard let i = p.index(of: id) else { continue }
+                    var t = orig
+                    t.scale = (orig.scale * factor).clamped(to: ClipTransform.scaleRange)
+                    t.x = pivotNormX + (orig.x - pivotNormX) * factor
+                    t.y = pivotNormY + (orig.y - pivotNormY) * factor
+                    t.clampAll()
+                    p.clips[i].transform = t.isIdentity ? nil : t
+                }
+                for (id, orig) in st.texts {
+                    guard let i = p.index(of: id) else { continue }
+                    let ox = orig.x - 0.5, oy = orig.y - 0.5
+                    p.clips[i].text.x = (0.5 + pivotNormX + (ox - pivotNormX) * factor).clamped(to: 0...1)
+                    p.clips[i].text.y = (0.5 + pivotNormY + (oy - pivotNormY) * factor).clamped(to: 0...1)
+                    p.clips[i].text.size = (orig.size * factor).clamped(to: 12...600)
+                }
+            }
+
+        default:
+            break
+        }
     }
 
     @ViewBuilder
@@ -527,6 +787,7 @@ struct PreviewView: View {
 
     private func endCanvasDrag() {
         canvasDrag = nil
+        groupDrag = nil
         moveStart = nil
         guides = SnapGuides()
         hudText = nil
@@ -543,6 +804,30 @@ struct PreviewView: View {
     // MARK: Native Mac Trackpad Gestures on Preview Canvas
 
     private func handleTrackpadPinch(magnification: Double, phase: NSEvent.Phase) {
+        let targets = activeTargets.filter(\.isTransformable)
+        if targets.count > 1, !model.isPlaying, source.current == nil {
+            if phase == .ended || phase == .cancelled {
+                hudText = nil
+                model.commitLive()
+                return
+            }
+            let factor = (1 + magnification).clamped(to: 0.5...2.0)
+            let ids = Set(targets.map(\.id))
+            let avgX = targets.map { ($0.transform ?? ClipTransform()).x }.reduce(0, +) / Double(targets.count)
+            let avgY = targets.map { ($0.transform ?? ClipTransform()).y }.reduce(0, +) / Double(targets.count)
+            hudText = String(format: "Scale %d layers", targets.count)
+            model.liveVisual(autoCommit: false) { p in
+                for i in p.clips.indices where ids.contains(p.clips[i].id) {
+                    var t = p.clips[i].transform ?? ClipTransform()
+                    t.scale = (t.scale * factor).clamped(to: ClipTransform.scaleRange)
+                    t.x = avgX + (t.x - avgX) * factor
+                    t.y = avgY + (t.y - avgY) * factor
+                    t.clampAll()
+                    p.clips[i].transform = t.isIdentity ? nil : t
+                }
+            }
+            return
+        }
         if let clip = activeTarget, clip.isTransformable, !model.isPlaying, source.current == nil {
             if phase == .began || gestureBaseScale == nil {
                 gestureBaseScale = (clip.transform ?? ClipTransform()).scale
@@ -577,6 +862,28 @@ struct PreviewView: View {
     }
 
     private func handleTrackpadRotate(deltaDegrees: Double, phase: NSEvent.Phase) {
+        let targets = activeTargets.filter(\.isTransformable)
+        if targets.count > 1, !model.isPlaying, source.current == nil {
+            if phase == .ended || phase == .cancelled {
+                hudText = nil
+                model.commitLive()
+                return
+            }
+            let ids = Set(targets.map(\.id))
+            hudText = String(format: "Rotate %d layers", targets.count)
+            model.liveVisual(autoCommit: false) { p in
+                for i in p.clips.indices where ids.contains(p.clips[i].id) {
+                    var t = p.clips[i].transform ?? ClipTransform()
+                    var deg = t.rotation - deltaDegrees
+                    while deg > 180 { deg -= 360 }
+                    while deg < -180 { deg += 360 }
+                    t.rotation = (deg * 10).rounded() / 10
+                    t.clampAll()
+                    p.clips[i].transform = t.isIdentity ? nil : t
+                }
+            }
+            return
+        }
         guard let clip = activeTarget, clip.isTransformable, !model.isPlaying, source.current == nil else { return }
         if phase == .began || gestureBaseRotation == nil {
             gestureBaseRotation = (clip.transform ?? ClipTransform()).rotation
@@ -824,6 +1131,134 @@ private struct CanvasQuickBar: View {
     }
 
     private func quickBtn(symbol: String, label: String, active: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack(spacing: 4) {
+                Image(systemName: symbol).font(.system(size: 10, weight: .semibold))
+                Text(label).font(.system(size: 10.5, weight: .medium))
+            }
+            .foregroundStyle(active ? Color.black : Theme.textDim)
+            .padding(.horizontal, 7)
+            .frame(height: 22)
+            .background(RoundedRectangle(cornerRadius: 5, style: .continuous).fill(active ? Color(hex: 0xF5C542) : Theme.raised))
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+/// Photoshop-style quick alignment & batch action bar shown when 2+ visual layers are Shift/Cmd-selected.
+private struct MultiCanvasQuickBar: View {
+    let clips: [Clip]
+    @ObservedObject var model: EditorModel
+
+    private var ids: Set<UUID> { Set(clips.map(\.id)) }
+    private var transformableIDs: Set<UUID> { Set(clips.filter(\.isTransformable).map(\.id)) }
+    private var cuttableIDs: Set<UUID> { Set(clips.filter { $0.kind == .video || $0.kind == .image }.map(\.id)) }
+
+    private enum AlignAxis { case left, centerH, right, top, centerV, bottom }
+
+    private func align(_ axis: AlignAxis) {
+        let xs = clips.map { $0.kind == .text ? ($0.text.x - 0.5) : ($0.transform?.x ?? 0) }
+        let ys = clips.map { $0.kind == .text ? ($0.text.y - 0.5) : ($0.transform?.y ?? 0) }
+        guard let minX = xs.min(), let maxX = xs.max(), let minY = ys.min(), let maxY = ys.max() else { return }
+        let midX = (minX + maxX) / 2
+        let midY = (minY + maxY) / 2
+        let targetX: Double? = switch axis {
+        case .left: minX
+        case .centerH: abs(maxX - minX) < 0.005 ? 0 : midX
+        case .right: maxX
+        default: nil
+        }
+        let targetY: Double? = switch axis {
+        case .top: minY
+        case .centerV: abs(maxY - minY) < 0.005 ? 0 : midY
+        case .bottom: maxY
+        default: nil
+        }
+        model.mutate { p in
+            for i in p.clips.indices where ids.contains(p.clips[i].id) {
+                if p.clips[i].kind == .text {
+                    if let targetX { p.clips[i].text.x = (0.5 + targetX).clamped(to: 0.05...0.95) }
+                    if let targetY { p.clips[i].text.y = (0.5 + targetY).clamped(to: 0.05...0.95) }
+                } else if p.clips[i].isTransformable {
+                    var t = p.clips[i].transform ?? ClipTransform()
+                    if let targetX { t.x = targetX }
+                    if let targetY { t.y = targetY }
+                    t.clampAll()
+                    p.clips[i].transform = t.isIdentity ? nil : t
+                }
+            }
+        }
+        AppleHaptics.align()
+    }
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "square.stack.3d.up.fill")
+                .font(.system(size: 10.5, weight: .semibold))
+                .foregroundStyle(Color(hex: 0x38BDF8))
+            Text("\(clips.count) layers · ⇧/⌘ click to toggle")
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(Theme.textDim)
+            Spacer(minLength: 8)
+
+            // Photoshop-style quick alignment buttons
+            alignBtn("align.horizontal.left", help: "Align Left Edges") { align(.left) }
+            alignBtn("align.horizontal.center", help: "Align Horizontal Centers (click again for frame center)") { align(.centerH) }
+            alignBtn("align.horizontal.right", help: "Align Right Edges") { align(.right) }
+            alignBtn("align.vertical.top", help: "Align Top Edges") { align(.top) }
+            alignBtn("align.vertical.center", help: "Align Vertical Centers (click again for frame center)") { align(.centerV) }
+            alignBtn("align.vertical.bottom", help: "Align Bottom Edges") { align(.bottom) }
+
+            if !transformableIDs.isEmpty {
+                let allPolished = clips.filter(\.isTransformable).allSatisfy { $0.style != nil }
+                batchBtn(symbol: "sparkles.rectangle.stack", label: "Polish", active: allPolished) {
+                    model.mutate { p in
+                        for i in p.clips.indices where transformableIDs.contains(p.clips[i].id) {
+                            p.clips[i].style = allPolished ? nil : .cardPolish
+                        }
+                    }
+                    AppleHaptics.click()
+                }
+            }
+            if !cuttableIDs.isEmpty {
+                let allCard = clips.filter { cuttableIDs.contains($0.id) }.allSatisfy { $0.bgRemoval?.mode == .aiCard }
+                batchBtn(symbol: "doc.text.viewfinder", label: "Keep Card", active: allCard) {
+                    model.mutate { p in
+                        for i in p.clips.indices where cuttableIDs.contains(p.clips[i].id) {
+                            p.clips[i].bgRemoval = allCard ? nil : BackgroundRemoval(mode: .aiCard, tolerance: 0.5, softness: 0.04)
+                        }
+                    }
+                    AppleHaptics.click()
+                }
+            }
+            batchBtn(symbol: "arrow.counterclockwise", label: "Reset", active: false) {
+                model.mutate { p in
+                    for i in p.clips.indices where transformableIDs.contains(p.clips[i].id) {
+                        p.clips[i].transform = nil
+                    }
+                }
+                AppleHaptics.click()
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 5)
+        .background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(Theme.field))
+        .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).strokeBorder(Color(hex: 0x38BDF8).opacity(0.35)))
+    }
+
+    private func alignBtn(_ symbol: String, help: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: symbol)
+                .font(.system(size: 10.5, weight: .semibold))
+                .foregroundStyle(Theme.textDim)
+                .frame(width: 24, height: 22)
+                .background(RoundedRectangle(cornerRadius: 5, style: .continuous).fill(Theme.raised))
+        }
+        .buttonStyle(.plain)
+        .help(help)
+    }
+
+    private func batchBtn(symbol: String, label: String, active: Bool, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             HStack(spacing: 4) {
                 Image(systemName: symbol).font(.system(size: 10, weight: .semibold))

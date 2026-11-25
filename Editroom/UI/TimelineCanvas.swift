@@ -454,7 +454,7 @@ final class TimelineCanvas: NSView {
         window?.makeFirstResponder(self)
         let p = convert(event.locationInWindow, from: nil)
         lastDragPoint = p
-        let extend = event.modifierFlags.contains(.shift)
+        let extend = event.modifierFlags.contains(.shift) || event.modifierFlags.contains(.command)
 
         if p.y < TimelineLayout.ruler {
             let onPlayhead = abs(p.x - x(model.playhead)) <= 9
@@ -536,6 +536,7 @@ final class TimelineCanvas: NSView {
         case .body:
             if extend {
                 if model.selection.contains(h.clip.id) { model.selection.subtract(group) } else { model.selection.formUnion(group) }
+                AppleHaptics.tick()
                 return
             }
             if !model.selection.contains(h.clip.id) { model.selection = group }
