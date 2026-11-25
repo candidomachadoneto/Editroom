@@ -32,6 +32,7 @@ final class VoiceBridge: ObservableObject {
     @Published private(set) var liveSubtitle: String = ""
     @Published private(set) var preferences: [EditingPreference] = []
     @Published private(set) var activeTeamStatus: String?
+    @Published private(set) var micLevel: Float = 0
 
     @Published var voiceModel: VoiceEngineModel {
         didSet {
@@ -127,6 +128,7 @@ final class VoiceBridge: ObservableObject {
         activeTeamStatus = nil
         handledCallIDs.removeAll()
         state = .listening
+        VoiceLog.info("Session START model=\(voiceModel.rawValue) vad=\(vadMode.rawValue)")
 
         // 1. Connect Realtime WebSocket immediately with cached state + learned taste.
         let initialInstructions = buildDynamicInstructions()
@@ -296,6 +298,13 @@ final class VoiceBridge: ObservableObject {
             self?.realtime.sendAudioChunk(pcm)
         }
 
+        audio.onMicLevel = { [weak self] level in
+            Task { @MainActor [weak self] in
+                guard let self, self.activeSession else { return }
+                self.micLevel = self.micLevel * 0.65 + level * 0.35
+            }
+        }
+
         audio.onPlaybackStateChanged = { [weak self] isPlaying in
             Task { @MainActor [weak self] in
                 guard let self, self.activeSession else { return }
@@ -316,10 +325,15 @@ final class VoiceBridge: ObservableObject {
 
     private func handleRealtimeEvent(_ event: RealtimeClient.Event) {
         switch event {
-        case .connected, .sessionReady:
+        case .connected:
+            VoiceLog.info("WS connected")
+            if activeSession, case .error = state { state = .listening }
+        case .sessionReady:
+            VoiceLog.info("WS session ready/updated")
             if activeSession, case .error = state { state = .listening }
 
         case .speechStarted:
+            VoiceLog.info("VAD speech_started (responseInProgress=\(responseInProgress))")
             // Instant barge-in: stop local playback immediately; only send response.cancel if a response is actually active!
             guard activeSession else { return }
             audio.interruptPlayback()
@@ -331,12 +345,14 @@ final class VoiceBridge: ObservableObject {
             state = .listening
 
         case .speechStopped:
-            break
+            VoiceLog.info("VAD speech_stopped")
 
         case .responseStarted:
+            VoiceLog.info("Response started")
             responseInProgress = true
 
         case .responseDone:
+            VoiceLog.info("Response done")
             responseInProgress = false
 
         case .audioDelta(let pcmData):
@@ -349,6 +365,7 @@ final class VoiceBridge: ObservableObject {
             liveSubtitle += delta
 
         case .functionCall(let name, let callID, let arguments):
+            VoiceLog.info("Function call: \(name) (\(callID))")
             guard activeSession else { return }
             // Idempotency guard: never execute the same tool call twice on reconnect.
             guard handledCallIDs.insert(callID).inserted else { return }
@@ -356,6 +373,7 @@ final class VoiceBridge: ObservableObject {
             Task { await self.executeTool(name: name, callID: callID, argumentsJSON: arguments, generation: gen) }
 
         case .serverError(let code, let msg):
+            VoiceLog.info("Server error [\(code)]: \(msg)")
             guard activeSession else { return }
             // Ignore benign Realtime state races (e.g. cancelling a response that already finished).
             let benignCodes: Set<String> = [
@@ -369,6 +387,7 @@ final class VoiceBridge: ObservableObject {
             handleConnectionFailure(msg)
 
         case .disconnected(let err):
+            VoiceLog.info("WS disconnected: \(err?.localizedDescription ?? "clean")")
             guard activeSession else { return }
             handleConnectionFailure(err?.localizedDescription ?? "Conexão de voz encerrada.")
         }

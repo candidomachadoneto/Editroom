@@ -1,10 +1,38 @@
 import AVFoundation
 import Foundation
 
-/// Low-latency full-duplex audio engine for Grok Voice 3.0 (`audio/pcm` 24kHz mono 16-bit LE).
-/// Captures microphone chunks immediately (in parallel with WebSocket handshake), streams
-/// incoming assistant PCM chunks to speaker output as soon as they arrive, and supports
-/// instant barge-in interruption (`interruptPlayback()`).
+/// Lightweight diagnostic logger for VoiceBridge (`~/Library/Logs/Editroom-VoiceBridge.log`).
+/// Never logs secrets or API keys.
+enum VoiceLog {
+    private static let queue = DispatchQueue(label: "editroom.voicebridge.log")
+    static let url: URL = {
+        let dir = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("Logs", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir.appendingPathComponent("Editroom-VoiceBridge.log")
+    }()
+
+    static func info(_ msg: String) {
+        let ts = ISO8601DateFormatter().string(from: Date())
+        let line = "[\(ts)] \(msg)\n"
+        queue.async {
+            guard let data = line.data(using: .utf8) else { return }
+            if FileManager.default.fileExists(atPath: url.path),
+               let fh = try? FileHandle(forWritingTo: url) {
+                _ = try? fh.seekToEnd()
+                try? fh.write(contentsOf: data)
+                try? fh.close()
+            } else {
+                try? data.write(to: url, options: .atomic)
+            }
+        }
+    }
+}
+
+/// Low-latency full-duplex audio engine for OpenAI / xAI Realtime (`audio/pcm` 24kHz mono 16-bit LE).
+/// Directly reads channel 0 from the hardware / AEC-processed input tap and resamples cleanly to
+/// 24kHz Int16 mono without relying on `AVAudioConverter` channel-layout heuristics (which zero out
+/// 3-channel Voice Processing IO streams on Apple Silicon macOS).
 final class VoiceAudioIO: @unchecked Sendable {
     static let wireSampleRate: Double = 24_000
 
@@ -14,22 +42,17 @@ final class VoiceAudioIO: @unchecked Sendable {
     private var captureActive = false
     private var engineRunning = false
     private var voiceProcessingConfigured = false
-    private var converter: AVAudioConverter?
     private var pendingBuffers = 0
     private var playbackFormat: AVAudioFormat?
     private var speechSynth: AVSpeechSynthesizer?
+    private var micChunksLogged = 0
 
     /// PCM16 24kHz mono chunks captured from the microphone.
     var onCapturedPCM: ((Data) -> Void)?
+    /// Normalized peak level (0...1) from microphone input for live UI visual feedback.
+    var onMicLevel: ((Float) -> Void)?
     /// Fires when speaker playback transitions between playing audio and drained/silent.
     var onPlaybackStateChanged: ((Bool) -> Void)?
-
-    private let wireFormat = AVAudioFormat(
-        commonFormat: .pcmFormatInt16,
-        sampleRate: VoiceAudioIO.wireSampleRate,
-        channels: 1,
-        interleaved: true
-    )!
 
     private let playFloatFormat = AVAudioFormat(
         commonFormat: .pcmFormatFloat32,
@@ -72,32 +95,27 @@ final class VoiceAudioIO: @unchecked Sendable {
 
         let inputNode = engine.inputNode
         if !voiceProcessingConfigured {
-            // Enable macOS hardware Acoustic Echo Cancellation (AEC) once before starting the graph.
-            try? inputNode.setVoiceProcessingEnabled(true)
+            // Enable macOS hardware Acoustic Echo Cancellation (AEC) so speaker voice doesn't re-trigger mic.
+            do {
+                try inputNode.setVoiceProcessingEnabled(true)
+                VoiceLog.info("AEC voice processing enabled")
+            } catch {
+                VoiceLog.info("AEC unavailable (falling back to standard mic): \(error.localizedDescription)")
+            }
             voiceProcessingConfigured = true
         }
         let hwFormat = inputNode.outputFormat(forBus: 0)
+        VoiceLog.info("Mic format: sr=\(hwFormat.sampleRate) ch=\(hwFormat.channelCount) fmt=\(hwFormat.commonFormat.rawValue) interleaved=\(hwFormat.isInterleaved)")
         guard hwFormat.sampleRate > 0, hwFormat.channelCount > 0 else {
             throw NSError(domain: "VoiceAudioIO", code: -1, userInfo: [
                 NSLocalizedDescriptionKey: "Nenhum microfone ativo encontrado neste Mac."
             ])
         }
 
-        // Convert hardware mic format (typically 48kHz Float32) -> 24kHz Int16 mono PCM.
-        let monoInputFormat = AVAudioFormat(
-            commonFormat: hwFormat.commonFormat,
-            sampleRate: hwFormat.sampleRate,
-            channels: 1,
-            interleaved: hwFormat.isInterleaved
-        ) ?? hwFormat
-        let conv = AVAudioConverter(from: hwFormat, to: wireFormat)
-            ?? AVAudioConverter(from: monoInputFormat, to: wireFormat)
-        converter = conv
-
-        // ~40ms buffer size at hardware sample rate for ultra-low latency streaming.
+        micChunksLogged = 0
         let tapFrames = AVAudioFrameCount(max(512, Int(hwFormat.sampleRate * 0.04)))
         inputNode.removeTap(onBus: 0)
-        inputNode.installTap(onBus: 0, bufferSize: tapFrames, format: hwFormat) { [weak self] buffer, _ in
+        inputNode.installTap(onBus: 0, bufferSize: tapFrames, format: nil) { [weak self] buffer, _ in
             self?.handleMicBuffer(buffer)
         }
 
@@ -110,6 +128,7 @@ final class VoiceAudioIO: @unchecked Sendable {
             playerNode.play()
         }
         captureActive = true
+        VoiceLog.info("Audio engine started (captureActive=true)")
     }
 
     /// Stops microphone capture and clears any queued response audio.
@@ -128,7 +147,9 @@ final class VoiceAudioIO: @unchecked Sendable {
             lock.lock()
             engineRunning = false
             lock.unlock()
+            VoiceLog.info("Audio engine stopped")
         }
+        onMicLevel?(0)
         onPlaybackStateChanged?(false)
     }
 
@@ -193,7 +214,7 @@ final class VoiceAudioIO: @unchecked Sendable {
         }
     }
 
-    /// Speaks a short Portuguese fallback notice locally if the xAI WebSocket drops (Requirement 4.3).
+    /// Speaks a short Portuguese fallback notice locally if the WebSocket drops.
     func speakLocalFallback(_ text: String) {
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
@@ -207,33 +228,86 @@ final class VoiceAudioIO: @unchecked Sendable {
         }
     }
 
+    /// Direct, zero-failure conversion from ANY hardware / VPIO channel layout -> 24kHz mono Int16 PCM.
     private func handleMicBuffer(_ buffer: AVAudioPCMBuffer) {
         lock.lock()
         let active = captureActive
-        let conv = converter
         lock.unlock()
-        guard active, let conv else { return }
+        guard active else { return }
 
-        let ratio = Self.wireSampleRate / max(1, buffer.format.sampleRate)
-        let outCap = AVAudioFrameCount(max(64, ceil(Double(buffer.frameLength) * ratio) + 16))
-        guard let outBuf = AVAudioPCMBuffer(pcmFormat: wireFormat, frameCapacity: outCap) else { return }
+        let frameCount = Int(buffer.frameLength)
+        guard frameCount > 0 else { return }
+        let srcRate = buffer.format.sampleRate
+        guard srcRate > 0 else { return }
 
-        var provided = false
-        var error: NSError?
-        let status = conv.convert(to: outBuf, error: &error) { _, outStatus in
-            if provided {
-                outStatus.pointee = .noDataNow
-                return nil
+        // Read channel 0 directly (primary AEC-processed mic channel on macOS VPIO & standard mics).
+        var floatSamples = [Float](repeating: 0, count: frameCount)
+        var peak: Float = 0
+
+        if let ch0 = buffer.floatChannelData?[0] {
+            if buffer.format.isInterleaved {
+                let stride = max(1, Int(buffer.format.channelCount))
+                for i in 0..<frameCount {
+                    let s = ch0[i * stride]
+                    floatSamples[i] = s
+                    peak = max(peak, abs(s))
+                }
+            } else {
+                for i in 0..<frameCount {
+                    let s = ch0[i]
+                    floatSamples[i] = s
+                    peak = max(peak, abs(s))
+                }
             }
-            provided = true
-            outStatus.pointee = .haveData
-            return buffer
+        } else if let ch0 = buffer.int16ChannelData?[0] {
+            let stride = buffer.format.isInterleaved ? max(1, Int(buffer.format.channelCount)) : 1
+            let scale: Float = 1.0 / 32768.0
+            for i in 0..<frameCount {
+                let s = Float(ch0[i * stride]) * scale
+                floatSamples[i] = s
+                peak = max(peak, abs(s))
+            }
+        } else {
+            return
         }
-        guard status != .error, error == nil, outBuf.frameLength > 0,
-              let ptr = outBuf.int16ChannelData?[0] else { return }
 
-        let byteCount = Int(outBuf.frameLength) * MemoryLayout<Int16>.size
-        let pcmData = Data(bytes: ptr, count: byteCount)
+        // Convert / linearly resample to 24,000 Hz Int16 Little-Endian mono.
+        let outCount: Int
+        var pcm16: [Int16]
+        if abs(srcRate - Self.wireSampleRate) < 1.0 {
+            outCount = frameCount
+            pcm16 = [Int16](repeating: 0, count: outCount)
+            for i in 0..<outCount {
+                let clamped = max(-1.0, min(1.0, floatSamples[i]))
+                pcm16[i] = Int16((clamped * 32767.0).rounded()).littleEndian
+            }
+        } else {
+            let ratio = srcRate / Self.wireSampleRate
+            outCount = max(1, Int((Double(frameCount) / ratio).rounded()))
+            pcm16 = [Int16](repeating: 0, count: outCount)
+            let lastIdx = frameCount - 1
+            for i in 0..<outCount {
+                let pos = Double(i) * ratio
+                let idx0 = min(lastIdx, Int(pos))
+                let idx1 = min(lastIdx, idx0 + 1)
+                let frac = Float(pos - Double(idx0))
+                let sample = floatSamples[idx0] * (1 - frac) + floatSamples[idx1] * frac
+                let clamped = max(-1.0, min(1.0, sample))
+                pcm16[i] = Int16((clamped * 32767.0).rounded()).littleEndian
+            }
+        }
+
+        let pcmData = pcm16.withUnsafeBytes { Data($0) }
+
+        lock.lock()
+        micChunksLogged += 1
+        let count = micChunksLogged
+        lock.unlock()
+        if count == 1 || count == 25 {
+            VoiceLog.info(String(format: "Mic chunk #%d: inFrames=%d outBytes=%d peak=%.4f", count, frameCount, pcmData.count, peak))
+        }
+
+        onMicLevel?(min(1, peak * 3.5))
         onCapturedPCM?(pcmData)
     }
 }

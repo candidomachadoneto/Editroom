@@ -524,10 +524,11 @@ struct MagicVoiceButton: View {
                 HStack(spacing: 5) {
                     ZStack {
                         if bridge.state == .listening || bridge.state == .speaking {
+                            let boost = CGFloat(bridge.state == .listening ? min(0.45, bridge.micLevel * 0.5) : 0.2)
                             Circle()
-                                .fill(accentColor.opacity(pulse ? 0.28 : 0.08))
+                                .fill(accentColor.opacity(pulse ? 0.30 : 0.10))
                                 .frame(width: 17, height: 17)
-                                .scaleEffect(pulse ? 1.18 : 0.85)
+                                .scaleEffect((pulse ? 1.12 : 0.88) + boost)
                         }
                         Image(systemName: iconName)
                             .font(.system(size: 11, weight: .semibold))
