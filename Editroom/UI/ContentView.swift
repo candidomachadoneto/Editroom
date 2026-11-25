@@ -107,6 +107,12 @@ struct ContentView: View {
                     .id(themes.look)
             }
             .withoutGlass()
+            ToolbarItem(placement: .primaryAction) {
+                MagicVoiceButton()
+                    .padding(.trailing, 4)
+                    .id(themes.look)
+            }
+            .withoutGlass()
             if magicEnabled {
                 ToolbarItem(placement: .primaryAction) {
                     MagicButton(model: model)
@@ -453,6 +459,141 @@ extension ToolbarContent {
 }
 
 
+/// Magic Voice button (Grok Voice 3.0 Realtime via VoiceBridge).
+/// Strictly decoupled: only calls `start()`, `stop()`, `toggle()`, and observes `VoiceBridge.state`.
+struct MagicVoiceButton: View {
+    @ObservedObject private var bridge = VoiceBridge.shared
+    @State private var hovering = false
+    @State private var pulse = false
+
+    private var tooltip: String {
+        switch bridge.state {
+        case .idle:
+            return "Magic — Diretor de Voz (⌘⇧M). Clique para falar."
+        case .listening:
+            return "Magic ouvindo… Clique ou pressione ⌘⇧M para parar."
+        case .speaking:
+            return "Magic respondendo… Fale por cima para interromper ou clique para parar."
+        case .error(let msg):
+            return msg
+        }
+    }
+
+    private var iconName: String {
+        switch bridge.state {
+        case .idle: return "wand.and.stars"
+        case .listening: return "wand.and.stars"
+        case .speaking: return "waveform"
+        case .error: return "exclamationmark.triangle.fill"
+        }
+    }
+
+    private var accentColor: Color {
+        switch bridge.state {
+        case .idle: return Theme.text
+        case .listening: return Theme.accent
+        case .speaking: return Color(hex: 0x38BDF8)
+        case .error: return Color(hex: 0xEF4444)
+        }
+    }
+
+    private var fillColor: Color {
+        switch bridge.state {
+        case .idle:
+            return Theme.ink.opacity(hovering ? 0.14 : 0.08)
+        case .listening:
+            return Theme.accent.opacity(hovering ? 0.24 : 0.18)
+        case .speaking:
+            return Color(hex: 0x38BDF8).opacity(hovering ? 0.24 : 0.18)
+        case .error:
+            return Color(hex: 0xEF4444).opacity(hovering ? 0.22 : 0.15)
+        }
+    }
+
+    private var strokeColor: Color {
+        switch bridge.state {
+        case .idle: return Theme.ink.opacity(0.05)
+        case .listening: return Theme.accent.opacity(pulse ? 0.85 : 0.45)
+        case .speaking: return Color(hex: 0x38BDF8).opacity(pulse ? 0.90 : 0.50)
+        case .error: return Color(hex: 0xEF4444).opacity(0.60)
+        }
+    }
+
+    var body: some View {
+        Button {
+            bridge.toggle()
+        } label: {
+            HStack(spacing: 5) {
+                ZStack {
+                    if bridge.state == .listening || bridge.state == .speaking {
+                        Circle()
+                            .fill(accentColor.opacity(pulse ? 0.28 : 0.08))
+                            .frame(width: 17, height: 17)
+                            .scaleEffect(pulse ? 1.18 : 0.85)
+                    }
+                    Image(systemName: iconName)
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(accentColor)
+                }
+                .frame(width: 14, height: 14)
+
+                Text("Magic")
+                    .font(.system(size: 11.5, weight: .semibold))
+                    .foregroundStyle(bridge.state == .idle ? Theme.text : accentColor)
+            }
+            .padding(.horizontal, 11)
+            .frame(height: 26)
+            .fixedSize()
+            .background(Capsule().fill(fillColor))
+            .overlay(Capsule().strokeBorder(strokeColor, lineWidth: bridge.state == .idle ? 1 : 1.3))
+            .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering = $0 }
+        .help(tooltip)
+        .contextMenu {
+            Button("Configurar XAI_API_KEY no Keychain…") {
+                promptForAPIKey()
+            }
+            if bridge.state.isActive {
+                Divider()
+                Button("Encerrar Sessão de Voz") { bridge.stop() }
+            }
+        }
+        .onAppear {
+            bridge.prewarm()
+        }
+        .onChange(of: bridge.state) { _, newState in
+            if newState == .listening || newState == .speaking {
+                withAnimation(.easeInOut(duration: 0.75).repeatForever(autoreverses: true)) {
+                    pulse = true
+                }
+            } else {
+                withAnimation(.easeOut(duration: 0.15)) {
+                    pulse = false
+                }
+            }
+        }
+    }
+
+    private func promptForAPIKey() {
+        let alert = NSAlert()
+        alert.messageText = "Chave xAI (XAI_API_KEY)"
+        alert.informativeText = "Cole sua chave da API xAI. Ela será salva com segurança apenas no Keychain do macOS (nunca em arquivos do projeto)."
+        let field = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 24))
+        field.placeholderString = "xai-..."
+        alert.accessoryView = field
+        alert.addButton(withTitle: "Salvar no Keychain")
+        alert.addButton(withTitle: "Cancelar")
+        if alert.runModal() == .alertFirstButtonReturn {
+            let key = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !key.isEmpty, VoiceKeychain.saveAPIKey(key) {
+                bridge.prewarm()
+            }
+        }
+    }
+}
+
 /// Starts the magic edit. With Claude or ChatGPT on this Mac, it asks what to make first, the AI works
 /// it out in the background, and the swarm plays it onto the timeline. Without one, the swarm builds a
 /// cut on its own. While the AI works, a click stops it.
@@ -538,16 +679,16 @@ struct MagicButton: View {
             }
         } label: {
             ZStack {
-                // Sized for who's working (or Magic), with room for Stop: it changes size only when a run
+                // Sized for who's working (or AI), with room for Stop: it changes size only when a run
                 // starts or ends, never during one.
-                face(worker ?? "Magic", spinning: worker != nil).hidden()
+                face(worker ?? "AI", spinning: worker != nil).hidden()
                 face("Stop", icon: "stop.fill").hidden()
                 Group {
                     if let worker {
                         face(worker, spinning: true)
                     } else {
                         // Finished while away: sparkles until they're back.
-                        face("Magic", icon: ai.ready != nil ? "sparkles" : "wand.and.sparkles")
+                        face("AI", icon: "sparkles")
                     }
                 }
                 .opacity(offerStop ? 0 : 1)

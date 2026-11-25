@@ -16,3 +16,4 @@ claude_desktop_config.json
 *.key
 secrets*
 dist/
+.backups/

@@ -61,6 +61,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 1) { Updates.shared.start() }
+        DispatchQueue.main.async { VoiceBridge.shared.prewarm() }
         NotificationCenter.default.addObserver(forName: NSMenu.didAddItemNotification, object: nil, queue: .main) { note in
             // Tidied once SwiftUI has finished updating the menus, never in the middle of it.
             MainActor.assumeIsolated { MenuCleanup.scheduleTidy() }
@@ -73,7 +74,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        MainActor.assumeIsolated { model?.autosaveNow() }
+        MainActor.assumeIsolated {
+            VoiceBridge.shared.shutdown()
+            model?.autosaveNow()
+        }
     }
 
     func application(_ application: NSApplication, open urls: [URL]) {
@@ -309,6 +313,9 @@ struct EditroomApp: App {
                 Toggle("Sticky Edges", isOn: $model.sticky).keyboardShortcut(keys.menu(.sticky))
                 Toggle("Skimming", isOn: $model.skimming).keyboardShortcut(keys.menu(.skimming))
                 Toggle("Audio Scrubbing", isOn: $model.audioScrub).keyboardShortcut(keys.menu(.audioScrubbing))
+                Divider()
+                Button("Magic Voice") { VoiceBridge.shared.toggle() }
+                    .keyboardShortcut("m", modifiers: [.command, .shift])
             }
         }
         Settings {

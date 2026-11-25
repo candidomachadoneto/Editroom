@@ -2,6 +2,8 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>O Editroom usa o microfone para o botão Magic (Grok Voice 3.0) ouvir comandos de edição em tempo real.</string>
 	<key>SUFeedURL</key>
 	<string>https://raw.githubusercontent.com/robbietilton/Editroom/main/appcast.xml</string>
 	<key>SUEnableAutomaticChecks</key>
