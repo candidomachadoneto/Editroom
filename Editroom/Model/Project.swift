@@ -231,6 +231,10 @@ enum BackgroundRemovalMode: String, Codable, Hashable, CaseIterable {
     /// Apple Neural Engine dedicated human/presenter segmentation (`VNGeneratePersonSegmentationRequest`) —
     /// smooth real-time cutout tailored for talking-head video.
     case aiPerson
+    /// Apple Neural Engine document/card segmentation (`VNDetectDocumentSegmentationRequest` +
+    /// `VNDetectRectanglesRequest`) — isolates a news card, article, print or overlay and erases
+    /// the surrounding studio/presenter background.
+    case aiCard
     /// GPU Color / Chroma Key for green screen, blue screen, or solid backgrounds.
     case chromaKey
 
@@ -238,6 +242,7 @@ enum BackgroundRemovalMode: String, Codable, Hashable, CaseIterable {
         switch self {
         case .aiSubject: return "AI Subject (Auto)"
         case .aiPerson: return "AI Person (Video)"
+        case .aiCard: return "AI Card (News/Doc)"
         case .chromaKey: return "Color Key"
         }
     }

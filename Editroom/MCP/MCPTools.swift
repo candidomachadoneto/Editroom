@@ -955,10 +955,10 @@ extension MCPTools {
                   "feather": num("Normalized soft edge feather (0...0.25, default 0)."),
                   "reset": ["type": "boolean", "description": "Remove the mask."]],
                  required: ["clip_id"]),
-            tool("set_background_removal", "AI Background Removal", "Removes the background from a video or image clip using Apple Neural Engine AI segmentation (aiSubject for any subject/object, aiPerson for talking-head video) or chromaKey, with live GPU tolerance, edge softness, and edge shrink controls.",
+            tool("set_background_removal", "AI Background Removal", "Removes the background from a video or image clip using Apple Neural Engine AI segmentation (aiSubject for any subject/object, aiPerson for talking-head video, aiCard to isolate a news card/article/document and erase studio/presenter background) or chromaKey, with live GPU tolerance, edge softness, and edge shrink controls.",
                  ["clip_id": str("A video or image clip's id."),
                   "enabled": ["type": "boolean", "description": "Turn background removal on or off (default true when other params are given)."],
-                  "mode": ["type": "string", "enum": BackgroundRemovalMode.allCases.map(\.rawValue), "description": "aiSubject (any subject/object), aiPerson (human video), or chromaKey."],
+                  "mode": ["type": "string", "enum": BackgroundRemovalMode.allCases.map(\.rawValue), "description": "aiSubject (any subject/object), aiPerson (human video), aiCard (news card/document cutout), or chromaKey."],
                   "tolerance": num("Cutout tolerance 0...1 (0 = strict, 0.5 = balanced, 1 = keep more foreground)."),
                   "softness": num("Edge feather softness 0...1 (default 0.15)."),
                   "edge_shift": num("Shrink (<0, removes edge halo) or expand (>0) matte, -1...1 (default 0)."),
@@ -1300,7 +1300,7 @@ extension MCPTools {
             let enabled = args["enabled"] as? Bool
             let mode = try (args["mode"] as? String).map { raw -> BackgroundRemovalMode in
                 guard let m = BackgroundRemovalMode(rawValue: raw) else {
-                    throw MCPToolError("mode is aiSubject, aiPerson or chromaKey.")
+                    throw MCPToolError("mode is aiSubject, aiPerson, aiCard or chromaKey.")
                 }
                 return m
             }

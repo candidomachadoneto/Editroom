@@ -748,13 +748,26 @@ private struct CanvasQuickBar: View {
                 .foregroundStyle(Theme.textDim)
             Spacer(minLength: 8)
             if clip.kind == .video || clip.kind == .image {
-                quickBtn(symbol: "person.and.background.dotted", label: "Remove BG", active: clip.bgRemoval != nil) {
+                let isPersonOrSubject = clip.bgRemoval != nil && clip.bgRemoval?.mode != .aiCard
+                let isCard = clip.bgRemoval?.mode == .aiCard
+                quickBtn(symbol: "person.and.background.dotted", label: "Remove BG", active: isPersonOrSubject) {
                     model.mutate { p in
                         guard let i = p.index(of: clip.id) else { return }
-                        if p.clips[i].bgRemoval != nil {
+                        if isPersonOrSubject {
                             p.clips[i].bgRemoval = nil
                         } else {
                             p.clips[i].bgRemoval = BackgroundRemoval(mode: p.clips[i].kind == .video ? .aiPerson : .aiSubject)
+                        }
+                    }
+                    AppleHaptics.click()
+                }
+                quickBtn(symbol: "doc.text.viewfinder", label: "Keep Card", active: isCard) {
+                    model.mutate { p in
+                        guard let i = p.index(of: clip.id) else { return }
+                        if isCard {
+                            p.clips[i].bgRemoval = nil
+                        } else {
+                            p.clips[i].bgRemoval = BackgroundRemoval(mode: .aiCard, tolerance: 0.5, softness: 0.04)
                         }
                     }
                     AppleHaptics.click()

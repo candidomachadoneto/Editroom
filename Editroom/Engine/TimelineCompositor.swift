@@ -55,9 +55,18 @@ final class BackgroundMatteEngine: @unchecked Sendable {
         let invert: Bool
     }
 
+    private struct CardQuad {
+        let topLeft: CGPoint
+        let topRight: CGPoint
+        let bottomRight: CGPoint
+        let bottomLeft: CGPoint
+    }
+
     private static let lock = NSLock()
     private static var matteCache: [MatteKey: CIImage] = [:]
     private static var matteOrder: [MatteKey] = []
+    private static var cardCache: [MatteKey: CardQuad] = [:]
+    private static var cardOrder: [MatteKey] = []
     private static var chromaCache: [ChromaKey: Data] = [:]
     private static let maxMattes = 90
 
@@ -65,12 +74,18 @@ final class BackgroundMatteEngine: @unchecked Sendable {
         lock.lock()
         matteCache.removeAll()
         matteOrder.removeAll()
+        cardCache.removeAll()
+        cardOrder.removeAll()
         lock.unlock()
     }
 
     static func apply(_ bg: BackgroundRemoval, to image: CIImage, clipID: UUID, at t: Double, isStill: Bool) -> CIImage {
         let extent = image.extent
         guard !extent.isInfinite, extent.width > 1, extent.height > 1 else { return image }
+
+        if bg.mode == .aiCard {
+            return applyCardIsolation(bg, to: image, extent: extent, clipID: clipID, at: t, isStill: isStill)
+        }
 
         if bg.mode == .chromaKey {
             let cube = chromaCube(color: bg.keyColor, tolerance: bg.tolerance, softness: bg.softness, invert: bg.invert)
@@ -190,6 +205,148 @@ final class BackgroundMatteEngine: @unchecked Sendable {
             kCIInputBackgroundImageKey: clear,
             kCIInputMaskImageKey: matte,
         ]).cropped(to: extent)
+    }
+
+    /// Isolates a news card, article, screenshot or document rectangle using Apple Vision
+    /// (`VNDetectDocumentSegmentationRequest` + `VNDetectRectanglesRequest` fallback), erasing
+    /// the surrounding studio/presenter background while letting Tolerance/Edge/Softness refine live.
+    private static func applyCardIsolation(_ bg: BackgroundRemoval, to image: CIImage, extent: CGRect,
+                                           clipID: UUID, at t: Double, isStill: Bool) -> CIImage {
+        // News cards in live streams stay steady across frames, so 4Hz bucketing keeps detection smooth & flicker-free.
+        let key = MatteKey(clipID: clipID,
+                           frameBucket: isStill ? 0 : Int((t * 4.0).rounded()),
+                           mode: .aiCard,
+                           width: Int(extent.width.rounded()),
+                           height: Int(extent.height.rounded()))
+        lock.lock()
+        let cachedQuad = cardCache[key]
+        lock.unlock()
+
+        let quad: CardQuad?
+        if let cachedQuad {
+            quad = cachedQuad
+        } else {
+            let detected = detectCardQuad(in: image)
+            if let detected {
+                lock.lock()
+                cardCache[key] = detected
+                cardOrder.append(key)
+                if cardOrder.count > maxMattes {
+                    let drop = cardOrder.removeFirst()
+                    cardCache.removeValue(forKey: drop)
+                }
+                lock.unlock()
+            }
+            quad = detected
+        }
+
+        guard let q = quad else { return image }
+
+        let w = Int(ceil(extent.width)), h = Int(ceil(extent.height))
+        guard w > 1, h > 1 else { return image }
+
+        // Vision coordinates are normalized with bottom-left origin (same y-up convention as Core Image).
+        func toPixel(_ pt: CGPoint) -> CGPoint {
+            CGPoint(x: pt.x * CGFloat(w), y: pt.y * CGFloat(h))
+        }
+        var pts = [toPixel(q.topLeft), toPixel(q.topRight), toPixel(q.bottomRight), toPixel(q.bottomLeft)]
+        let cx = pts.map(\.x).reduce(0, +) / 4
+        let cy = pts.map(\.y).reduce(0, +) / 4
+
+        // Tolerance (0...1, default 0.5) expands/contracts card bounds by ±8%; Edge Shift adds fine ±16px trim.
+        let tolScale = 1.0 + CGFloat((bg.tolerance.clamped(to: 0...1) - 0.5) * 0.16)
+        let edgePx = CGFloat(bg.edgeShift.clamped(to: -1...1) * 16.0)
+        pts = pts.map { pt in
+            let vx = pt.x - cx, vy = pt.y - cy
+            let len = max(1, hypot(vx, vy))
+            let nx = cx + vx * tolScale + (vx / len) * edgePx
+            let ny = cy + vy * tolScale + (vy / len) * edgePx
+            return CGPoint(x: nx, y: ny)
+        }
+
+        let colorSpace = CGColorSpaceCreateDeviceGray()
+        guard let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w,
+                                  space: colorSpace, bitmapInfo: CGImageAlphaInfo.none.rawValue) else { return image }
+        ctx.setFillColor(gray: 0, alpha: 1)
+        ctx.fill(CGRect(x: 0, y: 0, width: w, height: h))
+        ctx.setFillColor(gray: 1, alpha: 1)
+        let path = CGMutablePath()
+        path.move(to: pts[0])
+        path.addLine(to: pts[1])
+        path.addLine(to: pts[2])
+        path.addLine(to: pts[3])
+        path.closeSubpath()
+        ctx.addPath(path)
+        ctx.fillPath()
+
+        guard let cg = ctx.makeImage() else { return image }
+        var matte = CIImage(cgImage: cg)
+            .transformed(by: CGAffineTransform(translationX: extent.minX, y: extent.minY))
+            .cropped(to: extent)
+
+        if bg.softness > 0.01 {
+            let radius = CGFloat(bg.softness.clamped(to: 0...1) * 10.0)
+            let pad = ceil(radius * 3)
+            let black = CIImage(color: .black).cropped(to: extent.insetBy(dx: -pad, dy: -pad))
+            matte = matte.composited(over: black)
+                .applyingFilter("CIGaussianBlur", parameters: [kCIInputRadiusKey: radius])
+                .cropped(to: extent)
+        }
+        if bg.invert {
+            matte = matte.applyingFilter("CIColorInvert").cropped(to: extent)
+        }
+
+        let clear = CIImage(color: .clear).cropped(to: extent)
+        return image.applyingFilter("CIBlendWithMask", parameters: [
+            kCIInputBackgroundImageKey: clear,
+            kCIInputMaskImageKey: matte,
+        ]).cropped(to: extent)
+    }
+
+    private static func detectCardQuad(in image: CIImage) -> CardQuad? {
+        let e = image.extent
+        let normalized = image.transformed(by: CGAffineTransform(translationX: -e.minX, y: -e.minY))
+        let maxSide = max(e.width, e.height)
+        let visionInput: CIImage
+        if maxSide > 1024 {
+            let s = 1024 / maxSide
+            visionInput = normalized.transformed(by: CGAffineTransform(scaleX: s, y: s))
+        } else {
+            visionInput = normalized
+        }
+
+        let handler = VNImageRequestHandler(ciImage: visionInput, options: [.ciContext: TimelineCompositor.context])
+
+        // 1. Primary: Apple Neural Engine Document/Card Segmentation (captures colored headers + white body as 1 card).
+        let docReq = VNDetectDocumentSegmentationRequest()
+        if (try? handler.perform([docReq])) != nil,
+           let best = docReq.results?.first(where: { r in
+               let area = r.boundingBox.width * r.boundingBox.height
+               return area >= 0.04 && area <= 0.94 && r.confidence >= 0.5
+           }) {
+            return CardQuad(topLeft: best.topLeft, topRight: best.topRight,
+                            bottomRight: best.bottomRight, bottomLeft: best.bottomLeft)
+        }
+
+        // 2. Fallback: Vision Rectangle Detector (picks largest crisp non-full-frame card).
+        let rectReq = VNDetectRectanglesRequest()
+        rectReq.maximumObservations = 6
+        rectReq.minimumSize = 0.14
+        rectReq.minimumConfidence = 0.45
+        rectReq.minimumAspectRatio = 0.25
+        rectReq.maximumAspectRatio = 1.0
+        if (try? handler.perform([rectReq])) != nil,
+           let best = (rectReq.results ?? [])
+            .filter({ r in
+                let area = r.boundingBox.width * r.boundingBox.height
+                return area >= 0.04 && area <= 0.94
+            })
+            .max(by: { ($0.boundingBox.width * $0.boundingBox.height) < ($1.boundingBox.width * $1.boundingBox.height) }) {
+            return CardQuad(topLeft: best.topLeft, topRight: best.topRight,
+                            bottomRight: best.bottomRight, bottomLeft: best.bottomLeft)
+        }
+
+        return nil
     }
 
     /// Runs Apple Vision segmentation on the Neural Engine and returns a normalized grayscale `CIImage` matte.
