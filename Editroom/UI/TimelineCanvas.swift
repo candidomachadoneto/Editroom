@@ -122,9 +122,12 @@ final class TimelineCanvas: NSView {
     /// ⌥ held during a move: drop copies instead of moving the clips.
     private var duplicating = false
     private var lastScrubSnap: Double?
+    private var lastScrubTickIndex: Int?
+    private var lastForceStage: Int = 0
+    private var smartZoomRestorePPS: CGFloat?
 
     private static func tap() {
-        NSHapticFeedbackManager.defaultPerformer.perform(.alignment, performanceTime: .now)
+        AppleHaptics.align()
     }
     private var cutHover: (id: UUID, time: Double)?
     private var marquee: CGRect?
@@ -461,6 +464,8 @@ final class TimelineCanvas: NSView {
                     drag = .rangeEdge(isIn: isIn)
                     return
                 }
+                AppleHaptics.click()
+                lastScrubTickIndex = nil
                 drag = .scrub
                 scrub(to: p)
                 tick()
@@ -472,6 +477,8 @@ final class TimelineCanvas: NSView {
                 drag = .marker(id: id, startX: p.x, moved: false)
                 return
             }
+            AppleHaptics.click()
+            lastScrubTickIndex = nil
             drag = .scrub
             scrub(to: p)
             tick()
@@ -510,6 +517,7 @@ final class TimelineCanvas: NSView {
             updateHover(at: p)
             if let cut = cutHover {
                 model.split(clip: cut.id, at: cut.time)
+                AppleHaptics.click()
                 cutHover = nil
                 needsDisplay = true
             }
@@ -707,11 +715,35 @@ final class TimelineCanvas: NSView {
         updateHover(at: convert(event.locationInWindow, from: nil))
     }
 
+    /// Spacing between tactile ruler ticks at the current zoom level (matches drawRuler major/sub-steps).
+    private func rulerTickStep() -> Double {
+        let fps = max(1, model.project.fps)
+        let f = 1 / fps
+        let steps: [(Double, Int)] = [
+            (f, 1), (2 * f, 2), (5 * f, 5), (10 * f, 5), (1, 4), (2, 4), (5, 5), (10, 5), (15, 3), (30, 6),
+            (60, 6), (120, 4), (300, 5), (600, 5), (900, 3), (1800, 6), (3600, 6),
+        ]
+        var major = steps.last!.0
+        for s in steps where CGFloat(s.0) * pps >= 76 && (s.0 >= 1 || s.0 < 0.5) {
+            major = s.0
+            break
+        }
+        return major < 1 ? f : major
+    }
+
     private func scrub(to p: CGPoint) {
         var t = max(0, time(atX: p.x))
         let s = snap([t], to: model.project.snapTargets(excluding: []), pixels: 6)
         if let s { t += s.delta }
-        if let target = s?.target, target != lastScrubSnap { Self.tap() }
+        if let target = s?.target {
+            if target != lastScrubSnap { AppleHaptics.align() }
+        } else {
+            let tickIdx = Int(floor(t / max(1e-4, rulerTickStep())))
+            if let prev = lastScrubTickIndex, prev != tickIdx {
+                AppleHaptics.tick(minInterval: 0.038)
+            }
+            lastScrubTickIndex = tickIdx
+        }
         lastScrubSnap = s?.target
         model.scrub(to: t)
         model.scrubSound(at: model.playhead)
@@ -969,9 +1001,35 @@ final class TimelineCanvas: NSView {
 
     override func scrollWheel(with event: NSEvent) {
         let precise = event.hasPreciseScrollingDeltas
+        let p = convert(event.locationInWindow, from: nil)
         if event.modifierFlags.contains(.option) || event.modifierFlags.contains(.command) {
             let dy = event.scrollingDeltaY * (precise ? 1 : 8)
-            model.zoom(by: exp(dy * 0.012))
+            let hitLimit = model.zoom(by: exp(dy * 0.012), anchorX: max(0, min(bounds.width, p.x)))
+            if hitLimit { AppleHaptics.align() }
+            return
+        }
+        // Two-finger horizontal scrub directly over the timecode ruler moves the playhead needle
+        // smoothly with Taptic dial ticks (just like a jog wheel on the trackpad).
+        if precise, p.y >= 0, p.y < TimelineLayout.timeRuler,
+           abs(event.scrollingDeltaX) > abs(event.scrollingDeltaY),
+           abs(event.scrollingDeltaX) > 0.1 {
+            let dt = Double(-event.scrollingDeltaX) / Double(max(1, pps))
+            let newTime = max(0, min(max(model.project.duration, model.playhead), model.playhead + dt))
+            let s = snap([newTime], to: model.project.snapTargets(excluding: []), pixels: 4)
+            let finalTime = s.map { newTime + $0.delta } ?? newTime
+            if let target = s?.target, target != lastScrubSnap {
+                AppleHaptics.align()
+            } else {
+                let tickIdx = Int(floor(finalTime / max(1e-4, rulerTickStep())))
+                if let prev = lastScrubTickIndex, prev != tickIdx {
+                    AppleHaptics.tick(minInterval: 0.042)
+                }
+                lastScrubTickIndex = tickIdx
+            }
+            lastScrubSnap = s?.target
+            model.scrub(to: finalTime)
+            model.scrubSound(at: model.playhead)
+            tick()
             return
         }
         var dx = event.scrollingDeltaX, dy = event.scrollingDeltaY
@@ -989,7 +1047,48 @@ final class TimelineCanvas: NSView {
     }
 
     override func magnify(with event: NSEvent) {
-        model.zoom(by: 1 + event.magnification)
+        let p = convert(event.locationInWindow, from: nil)
+        let anchorX = bounds.contains(p) ? p.x : bounds.midX
+        let hitLimit = model.zoom(by: 1 + event.magnification, anchorX: anchorX)
+        if hitLimit { AppleHaptics.align() }
+    }
+
+    /// Two-finger double-tap on the Mac trackpad toggles between Fit-to-Timeline and focused edit zoom.
+    override func smartMagnify(with event: NSEvent) {
+        let p = convert(event.locationInWindow, from: nil)
+        let anchorX = bounds.contains(p) ? p.x : bounds.midX
+        let fitPPS = (view.viewWidth - 80) / CGFloat(max(model.project.duration, 1))
+        if abs(view.pps - fitPPS) > max(4, fitPPS * 0.15) {
+            smartZoomRestorePPS = view.pps
+            model.zoomToFit()
+        } else {
+            let targetPPS = max(smartZoomRestorePPS ?? 80, fitPPS * 3)
+            let anchorTime = (anchorX + view.scrollX) / max(1e-4, view.pps)
+            model.setView(pps: targetPPS, scrollX: anchorTime * targetPPS - anchorX)
+        }
+        AppleHaptics.align()
+    }
+
+    /// Force Touch deep-press (Stage 2) on a Mac trackpad:
+    /// - On the timecode ruler: drops a new Marker right at the pressed point.
+    /// - On a clip: selects it and jumps the playhead needle right there.
+    override func pressureChange(with event: NSEvent) {
+        let stage = event.stage
+        defer { lastForceStage = stage }
+        guard stage == 2, lastForceStage < 2 else { return }
+        let p = convert(event.locationInWindow, from: nil)
+        if p.y >= 0, p.y < TimelineLayout.timeRuler {
+            let t = max(0, model.project.snapFrame(time(atX: p.x)))
+            model.seek(to: t)
+            model.addMarker()
+            AppleHaptics.click()
+            tick()
+        } else if let h = hit(at: p) {
+            model.selection = [h.clip.id]
+            model.seek(to: max(0, model.project.snapFrame(time(atX: p.x))))
+            AppleHaptics.tick(minInterval: 0.01)
+            tick()
+        }
     }
 
     // MARK: Responder actions

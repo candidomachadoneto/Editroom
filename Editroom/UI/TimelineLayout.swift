@@ -104,3 +104,36 @@ enum Cursors {
         return NSCursor(image: image, hotSpot: NSPoint(x: 12, y: 12))
     }()
 }
+
+/// Centralized native macOS Force Touch / Taptic Engine haptics (`NSHapticFeedbackManager`).
+@MainActor
+enum AppleHaptics {
+    static let enabledKey = "hapticsEnabled"
+    private static var lastTick: CFTimeInterval = 0
+
+    static var isEnabled: Bool {
+        UserDefaults.standard.object(forKey: enabledKey) as? Bool ?? true
+    }
+
+    /// Magnetic alignment snap (cuts, markers, center/edge guides, 100% scale, 45° angles, fit zoom).
+    static func align() {
+        guard isEnabled else { return }
+        NSHapticFeedbackManager.defaultPerformer.perform(.alignment, performanceTime: .now)
+    }
+
+    /// Precision rotary-style micro-tick (ruler scrubbing, frame stepping, crop limit) — rate-limited
+    /// so rapid sweeps feel like a crisp physical dial instead of buzzing.
+    static func tick(minInterval: Double = 0.038) {
+        guard isEnabled else { return }
+        let now = CACurrentMediaTime()
+        guard now - lastTick >= minInterval else { return }
+        lastTick = now
+        NSHapticFeedbackManager.defaultPerformer.perform(.levelChange, performanceTime: .now)
+    }
+
+    /// Crisp tactile confirmation (ruler needle click, blade split, Force Click marker).
+    static func click() {
+        guard isEnabled else { return }
+        NSHapticFeedbackManager.defaultPerformer.perform(.generic, performanceTime: .now)
+    }
+}

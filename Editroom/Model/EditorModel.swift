@@ -1159,6 +1159,7 @@ final class EditorModel: ObservableObject {
 
     func step(frames: Int) {
         seek(to: playhead + Double(frames) / project.fps)
+        AppleHaptics.tick(minInterval: 0.024)
     }
 
     func jumpToEdit(forward: Bool) {
@@ -1296,6 +1297,20 @@ final class EditorModel: ObservableObject {
 
     func zoom(by factor: CGFloat) {
         setZoom(view.pps * factor)
+    }
+
+    /// Cursor-anchored trackpad pinch zoom: keeps the timeline moment under `anchorX` stationary.
+    /// Returns true if the zoom clamped against minPPS or maxPPS.
+    @discardableResult
+    func zoom(by factor: CGFloat, anchorX: CGFloat) -> Bool {
+        let old = view.pps
+        let raw = old * factor
+        let clamped = min(TimelineViewState.maxPPS, max(minPPS, raw))
+        let hitLimit = abs(raw - clamped) > 1e-6 && abs(old - clamped) > 1e-6
+        guard abs(clamped - old) > 1e-9 else { return false }
+        let anchorTime = (anchorX + view.scrollX) / old
+        setView(pps: clamped, scrollX: anchorTime * clamped - anchorX)
+        return hitLimit
     }
 
     func zoomToFit() {

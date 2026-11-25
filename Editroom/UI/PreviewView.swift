@@ -97,6 +97,10 @@ struct PreviewView: View {
     }
 
     @State private var hoveredHandle: CanvasHandle?
+    @State private var lastSnapScale100 = false
+    @State private var lastSnapAngle: Double?
+    @State private var gestureBaseScale: Double?
+    @State private var gestureBaseRotation: Double?
 
     init(model: EditorModel) {
         self.model = model
@@ -207,6 +211,13 @@ struct PreviewView: View {
                 .padding(.horizontal, 16)
                 .padding(.top, 16)
             }
+            .overlay(
+                PreviewTrackpadBridge(
+                    onMagnify: { mag, phase in handleTrackpadPinch(magnification: mag, phase: phase) },
+                    onRotate: { deg, phase in handleTrackpadRotate(deltaDegrees: deg, phase: phase) },
+                    onSmartMagnify: { handleTrackpadSmartMagnify() }
+                )
+            )
 
             // CapCut-style quick canvas bar when a visual transformable clip is selected.
             if let clip = activeTarget, clip.isTransformable, !model.viewerOnly {
@@ -519,12 +530,84 @@ struct PreviewView: View {
         moveStart = nil
         guides = SnapGuides()
         hudText = nil
+        lastSnapScale100 = false
+        lastSnapAngle = nil
         if let h = hoveredHandle, let c = activeTarget {
             CanvasCursors.cursor(for: h, rotationDeg: c.transform?.rotation ?? 0).set()
         } else {
             NSCursor.arrow.set()
         }
         model.commitLive()
+    }
+
+    // MARK: Native Mac Trackpad Gestures on Preview Canvas
+
+    private func handleTrackpadPinch(magnification: Double, phase: NSEvent.Phase) {
+        if let clip = activeTarget, clip.isTransformable, !model.isPlaying, source.current == nil {
+            if phase == .began || gestureBaseScale == nil {
+                gestureBaseScale = (clip.transform ?? ClipTransform()).scale
+                lastSnapScale100 = abs((gestureBaseScale ?? 1) - 1.0) < 0.005
+            }
+            if phase == .ended || phase == .cancelled {
+                gestureBaseScale = nil
+                hudText = nil
+                lastSnapScale100 = false
+                model.commitLive()
+                return
+            }
+            let cur = (clip.transform ?? ClipTransform()).scale
+            var ns = (cur * (1 + magnification)).clamped(to: ClipTransform.scaleRange)
+            let snapped = abs(ns - 1.0) < 0.02
+            if snapped { ns = 1.0 }
+            if snapped && !lastSnapScale100 { AppleHaptics.align() }
+            lastSnapScale100 = snapped
+            ns = (ns * 1000).rounded() / 1000
+            hudText = String(format: "Scale %.0f%%", ns * 100)
+            setTransform(clip.id) { $0.scale = ns }
+        } else {
+            // No clip selected: pinch smoothly zooms the viewer.
+            guard phase != .ended, phase != .cancelled else { return }
+            let base = zoom ?? 1.0
+            let next = (base * (1 + magnification)).clamped(to: 0.25...3.0)
+            let near100 = abs(next - 1.0) < 0.03
+            if near100 && !lastSnapScale100 { AppleHaptics.align() }
+            lastSnapScale100 = near100
+            zoom = near100 ? 1.0 : next
+        }
+    }
+
+    private func handleTrackpadRotate(deltaDegrees: Double, phase: NSEvent.Phase) {
+        guard let clip = activeTarget, clip.isTransformable, !model.isPlaying, source.current == nil else { return }
+        if phase == .began || gestureBaseRotation == nil {
+            gestureBaseRotation = (clip.transform ?? ClipTransform()).rotation
+            lastSnapAngle = nil
+        }
+        if phase == .ended || phase == .cancelled {
+            gestureBaseRotation = nil
+            hudText = nil
+            lastSnapAngle = nil
+            model.commitLive()
+            return
+        }
+        // AppKit NSEvent.rotation is positive counter-clockwise; ClipTransform.rotation is clockwise.
+        var deg = (gestureBaseRotation ?? 0) - deltaDegrees
+        gestureBaseRotation = deg
+        while deg > 180 { deg -= 360 }
+        while deg < -180 { deg += 360 }
+        var snappedAngle: Double?
+        for snap in [-180.0, -135.0, -90.0, -45.0, 0.0, 45.0, 90.0, 135.0, 180.0] {
+            if abs(deg - snap) < 3.5 { deg = snap; snappedAngle = snap; break }
+        }
+        if let sa = snappedAngle, sa != lastSnapAngle { AppleHaptics.align() }
+        lastSnapAngle = snappedAngle
+        deg = (deg * 10).rounded() / 10
+        hudText = String(format: "Rotate %.1f°", deg)
+        setTransform(clip.id) { $0.rotation = deg }
+    }
+
+    private func handleTrackpadSmartMagnify() {
+        zoom = (zoom == nil) ? 1.0 : nil
+        AppleHaptics.align()
     }
 
     private func handleTransformDrag(clip: Clip, handle: CanvasHandle, value: DragGesture.Value, canvasSize: CGSize) {
@@ -560,6 +643,11 @@ struct PreviewView: View {
                 if abs(rect.minY) < snapPx { ny -= Double(rect.minY) / h; g.topEdge = true }
                 else if abs(rect.maxY - canvasSize.height) < snapPx { ny -= Double(rect.maxY - canvasSize.height) / h; g.bottomEdge = true }
             }
+            if (g.centerX && !guides.centerX) || (g.centerY && !guides.centerY)
+                || (g.leftEdge && !guides.leftEdge) || (g.rightEdge && !guides.rightEdge)
+                || (g.topEdge && !guides.topEdge) || (g.bottomEdge && !guides.bottomEdge) {
+                AppleHaptics.align()
+            }
             guides = g
             let pxX = (nx * projW).rounded(), pxY = (ny * projH).rounded()
             hudText = String(format: "Pos %.0f, %.0f", pxX, pxY)
@@ -574,7 +662,10 @@ struct PreviewView: View {
             let d0 = max(10, hypot(st.startPoint.x - center.x, st.startPoint.y - center.y))
             let d1 = max(5, hypot(value.location.x - center.x, value.location.y - center.y))
             var ns = (st.initial.scale * Double(d1 / d0)).clamped(to: ClipTransform.scaleRange)
-            if abs(ns - 1.0) < 0.025 { ns = 1.0 }
+            let snapped100 = abs(ns - 1.0) < 0.025
+            if snapped100 { ns = 1.0 }
+            if snapped100 && !lastSnapScale100 { AppleHaptics.align() }
+            lastSnapScale100 = snapped100
             ns = (ns * 1000).rounded() / 1000
             guides = SnapGuides()
             hudText = String(format: "Scale %.0f%%", ns * 100)
@@ -587,9 +678,12 @@ struct PreviewView: View {
             var deg = st.initial.rotation + (ang - st.startAngle) * 180.0 / .pi
             while deg > 180 { deg -= 360 }
             while deg < -180 { deg += 360 }
+            var snappedAngle: Double?
             for snap in [-180.0, -135.0, -90.0, -45.0, 0.0, 45.0, 90.0, 135.0, 180.0] {
-                if abs(deg - snap) < 4.0 { deg = snap; break }
+                if abs(deg - snap) < 4.0 { deg = snap; snappedAngle = snap; break }
             }
+            if let sa = snappedAngle, sa != lastSnapAngle { AppleHaptics.align() }
+            lastSnapAngle = snappedAngle
             deg = (deg * 10).rounded() / 10
             guides = SnapGuides()
             hudText = String(format: "Rotate %.1f°", deg)
@@ -1047,4 +1141,78 @@ private enum CanvasCursors {
         }
         return NSCursor(image: image, hotSpot: NSPoint(x: 12, y: 12))
     }()
+}
+
+/// Transparent AppKit gesture bridge that forwards native Mac Multi-Touch trackpad gestures
+/// (pinch `.magnify`, two-finger twist `.rotate`, two-finger double-tap `.smartMagnify`)
+/// whenever the pointer is over the Preview Canvas, without interfering with clicks or drags.
+private struct PreviewTrackpadBridge: NSViewRepresentable {
+    var onMagnify: (Double, NSEvent.Phase) -> Void
+    var onRotate: (Double, NSEvent.Phase) -> Void
+    var onSmartMagnify: () -> Void
+
+    func makeNSView(context: Context) -> TrackpadMonitorView {
+        let v = TrackpadMonitorView()
+        v.onMagnify = onMagnify
+        v.onRotate = onRotate
+        v.onSmartMagnify = onSmartMagnify
+        return v
+    }
+
+    func updateNSView(_ nsView: TrackpadMonitorView, context: Context) {
+        nsView.onMagnify = onMagnify
+        nsView.onRotate = onRotate
+        nsView.onSmartMagnify = onSmartMagnify
+    }
+
+    final class TrackpadMonitorView: NSView {
+        var onMagnify: ((Double, NSEvent.Phase) -> Void)?
+        var onRotate: ((Double, NSEvent.Phase) -> Void)?
+        var onSmartMagnify: (() -> Void)?
+        private var monitor: Any?
+
+        override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            removeMonitor()
+            guard window != nil else { return }
+            monitor = NSEvent.addLocalMonitorForEvents(matching: [.magnify, .rotate, .smartMagnify]) { [weak self] event in
+                MainActor.assumeIsolated {
+                    guard let self, let win = self.window, event.window === win else { return event }
+                    let local = self.convert(event.locationInWindow, from: nil)
+                    guard self.bounds.contains(local) else { return event }
+                    switch event.type {
+                    case .magnify:
+                        self.onMagnify?(Double(event.magnification), event.phase)
+                        return nil
+                    case .rotate:
+                        self.onRotate?(Double(event.rotation), event.phase)
+                        return nil
+                    case .smartMagnify:
+                        self.onSmartMagnify?()
+                        return nil
+                    default:
+                        return event
+                    }
+                }
+            }
+        }
+
+        override func viewWillMove(toWindow newWindow: NSWindow?) {
+            super.viewWillMove(toWindow: newWindow)
+            if newWindow == nil { removeMonitor() }
+        }
+
+        deinit {
+            if let monitor { NSEvent.removeMonitor(monitor) }
+        }
+
+        private func removeMonitor() {
+            if let monitor {
+                NSEvent.removeMonitor(monitor)
+                self.monitor = nil
+            }
+        }
+    }
 }

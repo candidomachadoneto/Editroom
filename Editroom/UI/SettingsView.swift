@@ -96,6 +96,7 @@ private struct GeneralSettings: View {
     @ObservedObject var themes = ThemeStore.shared
     @AppStorage(MediaLayout.key) private var mediaLayout = MediaLayout.thumbnails
     @AppStorage(EditorModel.autosaveKey) private var autosave = true
+    @AppStorage(AppleHaptics.enabledKey) private var haptics = true
 
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
@@ -123,6 +124,16 @@ private struct GeneralSettings: View {
                 SettingsRow("Auto-save", detail: autosave ? "Saved projects save themselves as you edit."
                                                           : "Projects change only when you save (⌘S).") {
                     Toggle("", isOn: $autosave)
+                        .toggleStyle(.switch)
+                        .labelsHidden()
+                        .controlSize(.small)
+                        .tint(Theme.accent)
+                }
+            }
+            SettingsSection("Trackpad & Haptics") {
+                SettingsRow("Trackpad haptic feedback",
+                            detail: "Taptic ticks while scrubbing the ruler, magnetic snaps on cuts/guides/angles, pinch to zoom/scale, twist to rotate, two-finger double-tap smart zoom, Force Click ruler for marker.") {
+                    Toggle("", isOn: $haptics)
                         .toggleStyle(.switch)
                         .labelsHidden()
                         .controlSize(.small)
