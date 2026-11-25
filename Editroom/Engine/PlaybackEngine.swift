@@ -11,11 +11,17 @@ final class PlaybackEngine {
     let audio = AudioStream()
     /// What the sound was last made from, so it's only read again when something audible changed.
     private var audioKey: AudioKey?
+    private struct AudioRuntimeToken: Equatable {
+        var assetID: UUID
+        var trackID: ObjectIdentifier?
+        var reversedID: ObjectIdentifier?
+    }
     private struct AudioKey: Equatable {
-        var signature: Int?
         var tracks: [Track]
         var clips: [Clip]
         var duration: Double
+        var runtimes: [AudioRuntimeToken]
+        var duckSpanCount: Int
     }
     private(set) var duration: Double = 0
     private(set) var fps: Double = 30
@@ -66,20 +72,30 @@ final class PlaybackEngine {
     /// Rebuilds the player item. Changes that don't alter the edit structure only swap the video composition and mix.
     func rebuild(project: Project, media: MediaStore, at time: Double) {
         fps = project.fps
-        // The sound: read again only when something audible changed. Playing, the change is heard from
-        // just ahead of the playhead, with no break in the sound. Muting and soloing aren't such a change:
-        // each track's sound is silenced by its own lane, at once (unless a track ducks under another,
-        // whose sound then matters).
-        let sound = project.duration > 0
-            ? CompositionBuilder.build(project: project, media: media, renderSize: CGSize(width: 16, height: 16),
-                                       includeVideo: false, includeAudio: true, keepAllTracks: true)
-            : nil
+        endScrubFrames()
+        // The sound: read again only when something audible (or its underlying media runtime readiness)
+        // changed. Check AudioKey BEFORE building an audio AVMutableComposition so pure video edits
+        // (transform, crop, mask, grade, titles) never pay the cost of an audio composition rebuild.
         let ducking = project.audioTracks.contains { $0.duckUnder != nil }
-        let key = AudioKey(signature: sound?.signature,
-                           tracks: ducking ? project.audioTracks : project.audioTracks.map { var t = $0; t.muted = false; t.solo = false; return t },
-                           clips: project.clips.filter { $0.kind == .audio }, duration: project.duration)
+        let audioClips = project.clips.filter { $0.kind == .audio }
+        let runtimeTokens: [AudioRuntimeToken] = audioClips.compactMap { c -> AudioRuntimeToken? in
+            guard let id = c.assetID else { return nil }
+            let rt = media.runtimes[id]
+            return AudioRuntimeToken(assetID: id,
+                                     trackID: rt?.audioTrack.map(ObjectIdentifier.init),
+                                     reversedID: c.playsBackwards ? rt?.reversedAudio.map { ObjectIdentifier($0.track) } : nil)
+        }
+        let duckSpanCount = ducking
+            ? project.audioTracks.compactMap(\.duckUnder).reduce(0) { $0 + AudioLevels.activity(on: $1, project: project, media: media).count }
+            : 0
+        let key = AudioKey(tracks: ducking ? project.audioTracks : project.audioTracks.map { var t = $0; t.muted = false; t.solo = false; return t },
+                           clips: audioClips, duration: project.duration, runtimes: runtimeTokens, duckSpanCount: duckSpanCount)
         if key != audioKey {
             audioKey = key
+            let sound = project.duration > 0
+                ? CompositionBuilder.build(project: project, media: media, renderSize: CGSize(width: 16, height: 16),
+                                           includeVideo: false, includeAudio: true, keepAllTracks: true)
+                : nil
             // Each track's sound is read at the rate most of it is in (by length), so it isn't resampled on the way.
             var lanes: [UUID: (track: CMPersistentTrackID, rate: Double)] = [:]
             for (id, compTrack) in sound?.audioTracks ?? [:] {
@@ -100,6 +116,7 @@ final class PlaybackEngine {
         // The picture, silent.
         guard let built = CompositionBuilder.build(project: project, media: media,
                                                    renderSize: CompositionBuilder.previewSize(for: project), includeAudio: false, keepAllTracks: true) else {
+            TimelineCompositor.liveFrameCache.clear()
             abandonHandoff()
             audio.stop()
             player.replaceCurrentItem(with: nil)
@@ -109,6 +126,9 @@ final class PlaybackEngine {
             duration = 0
             isSeeking = false
             return
+        }
+        if signature != built.signature {
+            TimelineCompositor.liveFrameCache.clear()
         }
         duration = built.duration
         instruction = built.videoComposition.instructions.first as? TimelineInstruction
@@ -254,6 +274,7 @@ final class PlaybackEngine {
 
     private func refresh(at time: Double) {
         targetTime = clamp(time)
+        exactWanted = true
         if isSeeking { refreshPending = true } else { performSeek() }
     }
 
@@ -553,14 +574,45 @@ final class PlaybackEngine {
     private var renderSize = CGSize(width: 1920, height: 1080)
     private let scrubQueue = DispatchQueue(label: "editroom.scrub", qos: .userInteractive)
     private var scrubBusy = false
-    /// The latest scrub frame asked for, waiting for the one being drawn.
-    private var scrubNext: (time: Double, pictures: [Int: CIImage], still: CIImage?)?
+    /// The latest scrub/instant frame asked for, waiting for the one being drawn.
+    private var scrubNext: (time: Double, instruction: TimelineInstruction, pictures: [Int: CIImage], still: CIImage?)?
     /// A drawn scrub frame for the viewer's next refresh.
     private var scrubReady: (buffer: CVPixelBuffer, time: Double)?
     /// Bumped when scrubbing ends, so a frame still being drawn doesn't land over the exact one.
     private var scrubGeneration = 0
     private var scrubPool: CVPixelBufferPool?
     private var scrubPoolSize = CGSize.zero
+
+    /// Instant (<5ms) GPU re-compositing for interactive drag/crop/transform/mask/grade/title edits
+    /// while paused: reuses the cached raw source frames from TimelineCompositor (or ScrubCache)
+    /// without building an AVMutableComposition or seeking AVPlayer.
+    @discardableResult
+    func renderInstantFrame(project: Project, media: MediaStore, at t: Double, scrubCache: ScrubCache) -> Bool {
+        guard !isPlaying, project.duration > 0 else { return false }
+        let size = CompositionBuilder.previewSize(for: project)
+        guard let inst = CompositionBuilder.buildInstantInstruction(project: project, media: media, renderSize: size) else { return false }
+        renderSize = size
+        let at = max(0, min(t, max(0, project.duration - 0.5 / project.fps))) + 1e-4
+        let liveFrames = TimelineCompositor.liveFrameCache.lookup(time: t)
+        var pictures: [Int: CIImage] = [:]
+        for (i, layer) in inst.layers.enumerated() where at >= layer.start && at < layer.end {
+            switch layer.source {
+            case .track, .reversed, .decoded:
+                if let cached = liveFrames?[layer.clipID] {
+                    pictures[i] = cached
+                } else if let s = layer.scrub, let img = scrubCache.image(s.asset, at: s.time(at: at)) {
+                    pictures[i] = img
+                } else {
+                    return false
+                }
+            default:
+                continue
+            }
+        }
+        scrubNext = (at, inst, pictures, nil)
+        drawScrubFrame()
+        return true
+    }
 
     /// Shows the frame at `t` composited from made-ahead frames, if every video layer showing then has
     /// them. False when it can't (the player's seek has to do).
@@ -576,7 +628,7 @@ final class PlaybackEngine {
             default: continue
             }
         }
-        scrubNext = (at, pictures, nil)
+        scrubNext = (at, instruction, pictures, nil)
         drawScrubFrame()
         return true
     }
@@ -585,6 +637,7 @@ final class PlaybackEngine {
     /// One frame of a file filling the viewer (fitted, as the viewer fits the timeline): the new edge
     /// of a clip while it's trimmed. Drawn like a scrub frame, on the GPU straight into the viewer.
     func showStill(_ image: CIImage, orientation: CGImagePropertyOrientation, time: Double) {
+        guard let instruction else { return }
         let src = orientation == .up ? image : image.oriented(orientation)
         let e = src.extent
         guard e.width > 0, e.height > 0 else { return }
@@ -593,7 +646,7 @@ final class PlaybackEngine {
         let fitted = src.transformed(by: CGAffineTransform(a: s, b: 0, c: 0, d: s,
                                                            tx: (size.width - e.width * s) / 2 - e.minX * s,
                                                            ty: (size.height - e.height * s) / 2 - e.minY * s))
-        scrubNext = (time, [:], fitted.composited(over: CIImage(color: .black).cropped(to: CGRect(origin: .zero, size: size))))
+        scrubNext = (time, instruction, [:], fitted.composited(over: CIImage(color: .black).cropped(to: CGRect(origin: .zero, size: size))))
         stillShowing = true
         drawScrubFrame()
     }
@@ -618,7 +671,8 @@ final class PlaybackEngine {
     }
 
     private func drawScrubFrame() {
-        guard !scrubBusy, let job = scrubNext, let instruction else { return }
+        guard !scrubBusy, let job = scrubNext else { return }
+        let inst = job.instruction
         scrubNext = nil
         scrubBusy = true
         let size = renderSize
@@ -640,7 +694,7 @@ final class PlaybackEngine {
             var buffer: CVPixelBuffer?
             if let pool { CVPixelBufferPoolCreatePixelBuffer(nil, pool, &buffer) }
             if let buffer {
-                let image = job.still ?? TimelineCompositor.compose(instruction, at: job.time, output: size) { i, _ in job.pictures[i] }
+                let image = job.still ?? TimelineCompositor.compose(inst, at: job.time, output: size) { i, _ in job.pictures[i] }
                 TimelineCompositor.context.render(image, to: buffer, bounds: CGRect(origin: .zero, size: size), colorSpace: nil)
                 // Tagged as the player's frames are, so the viewer shows them in the same colours.
                 CVBufferSetAttachment(buffer, kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_ITU_R_709_2, .shouldPropagate)

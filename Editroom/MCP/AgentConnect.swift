@@ -3,13 +3,15 @@ import Foundation
 
 /// The AI apps Editroom can connect to with one click.
 enum AgentApp: String, CaseIterable, Identifiable {
-    case claude, chatgpt, claudeCode
+    case claude, chatgpt, gemini, grokBot, claudeCode
     var id: String { rawValue }
 
     var title: String {
         switch self {
         case .claude: "Claude"
         case .chatgpt: "ChatGPT"
+        case .gemini: "Gemini"
+        case .grokBot: "Grok Bot"
         case .claudeCode: "Claude Code"
         }
     }
@@ -19,6 +21,8 @@ enum AgentApp: String, CaseIterable, Identifiable {
         switch self {
         case .claude, .claudeCode: "Claude"
         case .chatgpt: "Codex"
+        case .gemini: "Gemini"
+        case .grokBot: "Grok-Diretor"
         }
     }
 
@@ -26,6 +30,8 @@ enum AgentApp: String, CaseIterable, Identifiable {
         switch self {
         case .claude: URL(string: "https://claude.ai/download")
         case .chatgpt: URL(string: "https://chatgpt.com/download")
+        case .gemini: URL(string: "https://github.com/google-gemini/gemini-cli")
+        case .grokBot: URL(string: "https://grok.com")
         case .claudeCode: nil
         }
     }
@@ -54,6 +60,8 @@ final class AgentConnect: ObservableObject {
     }
 
     @Published private(set) var states: [AgentApp: State] = [:]
+    /// True when the local Grok Bot Voice Swarm daemon (127.0.0.1:7842) is reachable.
+    @Published private(set) var grokSwarmOnline = false
 
     /// Where settings live. Self-tests point this at a throwaway folder.
     var home = FileManager.default.homeDirectoryForCurrentUser
@@ -62,9 +70,11 @@ final class AgentConnect: ObservableObject {
 
     static let claudeBundleID = "com.anthropic.claudefordesktop"
     static let chatgptBundleIDs = ["com.openai.codex", "com.openai.chat"]
+    static let grokBundleID = "com.anysphere.sand"
     static let editroomBundleID = Bundle.main.bundleIdentifier ?? "com.wonderassembly.Editroom"
 
     private var watch: Timer?
+    private var swarmCheckTask: Task<Void, Never>?
 
     // MARK: Status
 
@@ -73,6 +83,27 @@ final class AgentConnect: ObservableObject {
         for app in AgentApp.allCases {
             if case .working = states[app] { continue }
             states[app] = status(of: app)
+        }
+        checkGrokSwarm()
+    }
+
+    func checkGrokSwarm() {
+        guard !CommandLine.arguments.contains("--selftest"),
+              let url = URL(string: "http://127.0.0.1:7842/health") else { return }
+        swarmCheckTask?.cancel()
+        var request = URLRequest(url: url, timeoutInterval: 0.5)
+        request.httpMethod = "GET"
+        let immutableRequest = request
+        swarmCheckTask = Task { [weak self] in
+            let ok: Bool
+            if let (_, resp) = try? await URLSession.shared.data(for: immutableRequest),
+               let http = resp as? HTTPURLResponse {
+                ok = (200..<300).contains(http.statusCode)
+            } else {
+                ok = false
+            }
+            guard !Task.isCancelled else { return }
+            self?.grokSwarmOnline = ok
         }
     }
 
@@ -86,6 +117,16 @@ final class AgentConnect: ObservableObject {
             if codexConnected { return .connected }
             let installed = Self.chatgptBundleIDs.contains { Self.appURL($0) != nil }
                 || FileManager.default.fileExists(atPath: codexHome.path)
+            return installed ? .ready : .missing
+        case .gemini:
+            if geminiConnected { return .connected }
+            let installed = geminiCLI != nil || FileManager.default.fileExists(atPath: geminiHome.path)
+            return installed ? .ready : .missing
+        case .grokBot:
+            if grokConnected { return .connected }
+            let installed = Self.appURL(Self.grokBundleID) != nil
+                || grokCLI != nil
+                || FileManager.default.fileExists(atPath: grokHome.path)
             return installed ? .ready : .missing
         case .claudeCode:
             if claudeCodeConnected { return .connected }
@@ -116,6 +157,8 @@ final class AgentConnect: ObservableObject {
                     // Installed already (and only turned off here): nothing more to do.
                     if !claudeExtensionInstalled { try connectClaude() }
                 case .chatgpt: try connectCodex()
+                case .gemini: try connectGemini()
+                case .grokBot: try connectGrok()
                 case .claudeCode: try await runClaudeCLI(["mcp", "add", "--scope", "user", "--transport", "http", "editroom", MCPServer.endpoint])
                 }
                 if app == .claude, openInClaude, !claudeExtensionInstalled {
@@ -139,6 +182,8 @@ final class AgentConnect: ObservableObject {
                     // Claude keeps its own list of extensions; Editroom stops answering this one.
                     claudeAppOff = true
                 case .chatgpt: try disconnectCodex()
+                case .gemini: try disconnectGemini()
+                case .grokBot: try disconnectGrok()
                 case .claudeCode: try await runClaudeCLI(["mcp", "remove", "--scope", "user", "editroom"])
                 }
                 states[app] = status(of: app)
@@ -210,9 +255,11 @@ final class AgentConnect: ObservableObject {
     }
 
     /// Writes the launcher (refreshed every time, in case Editroom moved) and returns its path.
+    /// Uses per-app filenames in `supportFolder` so Codex, Gemini and Grok never overwrite each other's `--from`.
     private func writeLauncher(in folder: URL, from: String = "") throws -> URL {
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-        let url = folder.appendingPathComponent("editroom-mcp")
+        let filename = (from.isEmpty || from == "claude-app") ? "editroom-mcp" : "editroom-mcp-\(from)"
+        let url = folder.appendingPathComponent(filename)
         try Self.launcherScript(from: from).write(to: url, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
         return url
@@ -226,7 +273,12 @@ final class AgentConnect: ObservableObject {
         guard !Self.followed, !CommandLine.arguments.contains("--selftest") else { return }
         Self.followed = true
         let fm = FileManager.default
-        var launchers = [(supportFolder.appendingPathComponent("editroom-mcp"), "codex")]
+        var launchers = [
+            (supportFolder.appendingPathComponent("editroom-mcp"), "codex"),
+            (supportFolder.appendingPathComponent("editroom-mcp-codex"), "codex"),
+            (supportFolder.appendingPathComponent("editroom-mcp-gemini"), "gemini"),
+            (supportFolder.appendingPathComponent("editroom-mcp-grok"), "grok"),
+        ]
         let extensions = claudeSupport.appendingPathComponent("Claude Extensions", isDirectory: true)
         for item in (try? fm.contentsOfDirectory(at: extensions, includingPropertiesForKeys: nil)) ?? [] {
             if let data = try? Data(contentsOf: item.appendingPathComponent("manifest.json")),
@@ -361,17 +413,18 @@ final class AgentConnect: ObservableObject {
     /// The config with Editroom's section (and any `[mcp_servers.editroom.*]` under it) taken out.
     /// Every other line is left exactly as it was.
     static func removingEditroom(from text: String) -> String {
+        let normalized = text.replacingOccurrences(of: "\r\n", with: "\n").replacingOccurrences(of: "\r", with: "\n")
         var out: [String] = []
         var skipping = false
-        for line in text.components(separatedBy: "\n") {
-            let t = line.trimmingCharacters(in: .whitespaces)
+        for line in normalized.components(separatedBy: "\n") {
+            let t = line.trimmingCharacters(in: .whitespacesAndNewlines)
             if t.hasPrefix("[") {
                 skipping = t == codexHeader || t.hasPrefix("[mcp_servers.editroom.")
             }
             if !skipping { out.append(line) }
         }
         // Drop the blank lines left at the end.
-        while let last = out.last, last.trimmingCharacters(in: .whitespaces).isEmpty { out.removeLast() }
+        while let last = out.last, last.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { out.removeLast() }
         return out.joined(separator: "\n")
     }
 
@@ -405,6 +458,105 @@ final class AgentConnect: ObservableObject {
 
     static func tomlString(_ s: String) -> String {
         "\"" + s.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"") + "\""
+    }
+
+    // MARK: Gemini CLI (~/.gemini/settings.json)
+
+    var geminiHome: URL { home.appendingPathComponent(".gemini", isDirectory: true) }
+    private var geminiSettings: URL { geminiHome.appendingPathComponent("settings.json") }
+
+    var geminiCLI: URL? {
+        let fm = FileManager.default
+        let h = home.path
+        let known = ["\(h)/.local/bin/gemini", "/opt/homebrew/bin/gemini", "/usr/local/bin/gemini", "\(h)/.npm-global/bin/gemini"]
+        return known.first(where: { fm.isExecutableFile(atPath: $0) }).map { URL(fileURLWithPath: $0) }
+    }
+
+    var geminiConnected: Bool {
+        guard let data = try? Data(contentsOf: geminiSettings),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return false }
+        return (json["mcpServers"] as? [String: Any])?["editroom"] != nil
+    }
+
+    func connectGemini() throws {
+        let fm = FileManager.default
+        try fm.createDirectory(at: geminiHome, withIntermediateDirectories: true)
+        let launcher = try writeLauncher(in: supportFolder, from: "gemini")
+        var root: [String: Any] = [:]
+        if let existing = try? Data(contentsOf: geminiSettings),
+           let raw = String(data: existing, encoding: .utf8),
+           !raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            let backup = geminiHome.appendingPathComponent("settings.json.before-editroom")
+            if !fm.fileExists(atPath: backup.path) { try existing.write(to: backup, options: .atomic) }
+            guard let parsed = try? JSONSerialization.jsonObject(with: existing) as? [String: Any] else {
+                throw ConnectError(message: "~/.gemini/settings.json isn't valid JSON. Fix it before connecting.")
+            }
+            root = parsed
+        }
+        var servers = root["mcpServers"] as? [String: Any] ?? [:]
+        servers["editroom"] = [
+            "command": "/bin/sh",
+            "args": [launcher.path],
+            "trust": true,
+            "timeout": 300_000,
+        ] as [String: Any]
+        root["mcpServers"] = servers
+        let out = try JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes])
+        try out.write(to: geminiSettings, options: .atomic)
+    }
+
+    func disconnectGemini() throws {
+        guard let data = try? Data(contentsOf: geminiSettings),
+              var root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              var servers = root["mcpServers"] as? [String: Any] else { return }
+        servers.removeValue(forKey: "editroom")
+        root["mcpServers"] = servers
+        let out = try JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes])
+        try out.write(to: geminiSettings, options: .atomic)
+    }
+
+    // MARK: Grok Bot & Voice Director (~/.grok/config.toml)
+
+    var grokHome: URL { home.appendingPathComponent(".grok", isDirectory: true) }
+    private var grokConfig: URL { grokHome.appendingPathComponent("config.toml") }
+
+    var grokCLI: URL? {
+        let fm = FileManager.default
+        let h = home.path
+        let known = ["\(h)/.local/bin/grok", "/opt/homebrew/bin/grok", "/usr/local/bin/grok"]
+        return known.first(where: { fm.isExecutableFile(atPath: $0) }).map { URL(fileURLWithPath: $0) }
+    }
+
+    var grokConnected: Bool {
+        guard let text = try? String(contentsOf: grokConfig, encoding: .utf8) else { return false }
+        return text.components(separatedBy: .newlines).contains { $0.trimmingCharacters(in: .whitespaces) == Self.codexHeader }
+    }
+
+    func connectGrok() throws {
+        let fm = FileManager.default
+        try fm.createDirectory(at: grokHome, withIntermediateDirectories: true)
+        let launcher = try writeLauncher(in: supportFolder, from: "grok")
+        let existing = (try? String(contentsOf: grokConfig, encoding: .utf8)) ?? ""
+        if !existing.isEmpty {
+            let backup = grokHome.appendingPathComponent("config.toml.before-editroom")
+            if !fm.fileExists(atPath: backup.path) { try existing.write(to: backup, atomically: true, encoding: .utf8) }
+        }
+        var text = Self.removingEditroom(from: existing)
+        if !text.isEmpty { text += "\n\n" }
+        text += """
+        \(Self.codexHeader)
+        command = "/bin/sh"
+        args = [\(Self.tomlString(launcher.path))]
+        startup_timeout_sec = 30
+        tool_timeout_sec = 300
+
+        """
+        try text.write(to: grokConfig, atomically: true, encoding: .utf8)
+    }
+
+    func disconnectGrok() throws {
+        guard let existing = try? String(contentsOf: grokConfig, encoding: .utf8) else { return }
+        try (Self.removingEditroom(from: existing) + "\n").write(to: grokConfig, atomically: true, encoding: .utf8)
     }
 
     // MARK: Claude Code

@@ -265,7 +265,7 @@ enum CompositionBuilder {
             captions = CaptionRenderer.layers(CaptionLayout.blocks(project) { media.transcript($0.id) }, style: track.style)
         }
         vc.instructions = [TimelineInstruction(timeRange: range, layers: layers, trackIDs: requiredTracks, canvas: canvas, offset: offset,
-                                               captions: captions)]
+                                               captions: captions, cacheLiveFrames: keepAllTracks)]
 
         var mix: AVMutableAudioMix?
         if !mixParams.isEmpty {
@@ -299,8 +299,61 @@ enum CompositionBuilder {
         hasher.combine(clip.duration)
         hasher.combine(clip.sourceStart)
         hasher.combine(clip.speed)
+        hasher.combine(clip.freeze)
         hasher.combine(clip.reversed)
         hasher.combine(clip.ramp)
+    }
+
+    /// Lightweight instruction builder for instant (<5ms) GPU preview re-compositing without
+    /// constructing any AVMutableComposition or touching AVAssetTracks.
+    @MainActor
+    static func buildInstantInstruction(project: Project, media: MediaStore, renderSize: CGSize) -> TimelineInstruction? {
+        let total = project.duration
+        guard total > 0 else { return nil }
+        let frame = CGRect(origin: .zero, size: renderSize)
+        var layers: [RenderLayer] = []
+        for track in project.videoTracks where !track.hidden {
+            let clips = project.clips.filter { $0.trackID == track.id }.sorted { $0.start < $1.start }
+            for clip in clips {
+                let plan = project.transitionPlan(clip)
+                switch clip.kind {
+                case .video:
+                    guard let id = clip.assetID, let rt = media.runtimes[id] else { continue }
+                    var shown = clip
+                    shown.start -= plan.leadIn
+                    if !clip.isFreeze { shown.sourceStart = clip.sourceTime(at: shown.start) }
+                    let revLen = clip.playsBackwards ? project.asset(id)?.duration : nil
+                    let scrub = rt.sourceColor.isStandard ? ScrubSource(asset: id, clock: SourceClock(shown), reversedLength: revLen) : nil
+                    layers.append(RenderLayer(clip: clip, source: .track(kCMPersistentTrackID_Invalid, rt.orientation),
+                                              cube: GradeBaker.cube(for: clip.grade), color: rt.sourceColor, plan: plan, scrub: scrub))
+                case .image:
+                    guard let cg = media.still(clip.assetID) else { continue }
+                    let img = CIImage(cgImage: cg)
+                    let e = img.extent
+                    guard e.width > 0, e.height > 0 else { continue }
+                    let s = min(frame.width / e.width, frame.height / e.height)
+                    let fitted = img.transformed(by: CGAffineTransform(a: s, b: 0, c: 0, d: s,
+                                                                       tx: (frame.width - e.width * s) / 2,
+                                                                       ty: (frame.height - e.height * s) / 2))
+                    layers.append(RenderLayer(clip: clip, source: .image(fitted), cube: GradeBaker.cube(for: clip.grade), plan: plan))
+                case .solid:
+                    let c = clip.color
+                    layers.append(RenderLayer(clip: clip, source: .color(CIColor(red: c.r, green: c.g, blue: c.b, alpha: c.a)),
+                                              cube: GradeBaker.cube(for: clip.grade), plan: plan))
+                case .text:
+                    guard let img = TextRenderer.image(clip.text, renderSize: renderSize) else { continue }
+                    layers.append(RenderLayer(clip: clip, source: .image(img), cube: GradeBaker.cube(for: clip.grade), plan: plan))
+                case .audio:
+                    continue
+                }
+            }
+        }
+        var captions: [CaptionLayer] = []
+        if let track = project.captions, !track.hidden {
+            captions = CaptionRenderer.layers(CaptionLayout.blocks(project) { media.transcript($0.id) }, style: track.style)
+        }
+        return TimelineInstruction(timeRange: CMTimeRange(start: .zero, duration: time(total)),
+                                   layers: layers, trackIDs: [], canvas: renderSize, offset: .zero, captions: captions)
     }
 
     /// Places one clip's media on a composition track, applying speed by scaling the inserted range.

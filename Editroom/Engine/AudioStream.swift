@@ -70,6 +70,15 @@ final class AudioStream: @unchecked Sendable {
     /// Where each stretch of render time starts, for telling which timeline time is being heard.
     private var stretches: [(render: CMTime, offset: CMTime)] = []
     private var playing = false
+    /// Non-blocking snapshot for main-thread timelineTime(atHost:) queries so CADisplayLink never stalls on `queue.sync`.
+    private let timingLock = NSLock()
+    private var timingSnapshot: (playing: Bool, stretches: [(render: CMTime, offset: CMTime)]) = (false, [])
+
+    private func publishTiming() {
+        timingLock.lock()
+        timingSnapshot = (playing, stretches)
+        timingLock.unlock()
+    }
     /// The tracks of the last load: a lane of any other track is only waiting to be taken out once stopped.
     private var wanted = Set<UUID>()
 
@@ -173,10 +182,13 @@ final class AudioStream: @unchecked Sendable {
                 lane.renderer.flush()
             }
             let start = CompositionBuilder.time(t)
-            // Render time is timeline time at the start.
+            // Keep timebase rate change and timingSnapshot atomic with timelineTime(atHost:).
+            self.timingLock.lock()
             self.synchronizer.setRate(1, time: start, atHostTime: host)
             self.playing = true
             self.stretches = [(start, .zero)]
+            self.timingSnapshot = (true, self.stretches)
+            self.timingLock.unlock()
             for lane in self.lanes.values {
                 lane.held = nil
                 lane.queuedEnd = (start, start)
@@ -188,8 +200,12 @@ final class AudioStream: @unchecked Sendable {
 
     func stop() {
         queue.async {
+            self.timingLock.lock()
             self.playing = false
+            self.stretches = []
+            self.timingSnapshot = (false, [])
             self.synchronizer.rate = 0
+            self.timingLock.unlock()
             // Renderers of tracks that went while playing go now.
             for (id, lane) in self.lanes where !self.wanted.contains(id) {
                 self.synchronizer.removeRenderer(lane.renderer, at: .invalid)
@@ -202,18 +218,17 @@ final class AudioStream: @unchecked Sendable {
                 lane.renderer.flush()
                 lane.queuedEnd = nil
             }
-            self.stretches = []
         }
     }
 
     /// The timeline time being heard at host time `host` (nil while stopped), for checking against the picture.
     func timelineTime(atHost host: CMTime) -> Double? {
-        queue.sync {
-            guard playing else { return nil }
-            let render = CMSyncConvertTime(host, from: CMClockGetHostTimeClock(), to: synchronizer.timebase)
-            guard let stretch = stretch(at: render) else { return nil }
-            return (render - stretch.offset).seconds
-        }
+        timingLock.lock()
+        defer { timingLock.unlock() }
+        guard timingSnapshot.playing else { return nil }
+        let render = CMSyncConvertTime(host, from: CMClockGetHostTimeClock(), to: synchronizer.timebase)
+        guard let stretch = timingSnapshot.stretches.last(where: { $0.render <= render }) ?? timingSnapshot.stretches.first else { return nil }
+        return (render - stretch.offset).seconds
     }
 
     // MARK: On the queue
@@ -280,6 +295,7 @@ final class AudioStream: @unchecked Sendable {
         guard reader.startReading() else { return nil }
         if stretches.last?.offset != offset { stretches.append((start + offset, offset)) }
         if stretches.count > 8 { stretches.removeFirst(stretches.count - 8) }
+        publishTiming()
         return Feed(reader: reader, output: output, offset: offset, from: start, until: end, rate: lane.rate)
     }
 

@@ -2045,6 +2045,83 @@ enum SelfTest {
             log("CAPTIONS \(good ? "OK" : "FAIL") sound=\(picksSound) phrases=\(phrases) \(texts) placed=\(placed) follows=\(follows) \(moved.map { String(format: "%.3f", $0.start) }) fixed=\(fixed) drawn=\(drawn) removed=\(removed) trackGoes=\(trackGoes) afresh=\(afresh) typing=\(fewer)/\(back)")
             ok = ok && good
         }
+        let proOK = await testCropMaskPro(media: media)
+        ok = ok && proOK
         log(ok ? "SELFTEST OK" : "SELFTEST FAIL")
+    }
+
+    @MainActor
+    private static func testCropMaskPro(media: MediaStore) async -> Bool {
+        // 1. Old .room ClipTransform JSON decodes cleanly with safe defaults.
+        let oldTF = #"{"scale":1.5,"x":0.1,"y":-0.2}"#
+        let dec = try? JSONDecoder().decode(ClipTransform.self, from: Data(oldTF.utf8))
+        let compat = dec != nil && dec?.scale == 1.5 && dec?.cropLeft == 0 && dec?.maskShape == MaskShape.none && dec?.opacity == 1 && dec?.rotation == 0
+
+        // 2. Clamping keeps at least 5% visible width/height.
+        var clamped = ClipTransform(cropLeft: 0.7, cropRight: 0.7, cropTop: 0.8, cropBottom: 0.6)
+        clamped.clampAll()
+        let clampOK = (clamped.cropLeft + clamped.cropRight) <= 0.9501 && (clamped.cropTop + clamped.cropBottom) <= 0.9501
+
+        // 3. Pixel-level verification of 4-side crop + circle mask in TimelineCompositor.
+        var p = Project()
+        p.width = 200; p.height = 200; p.fps = 30
+        var solid = Clip(trackID: p.videoTracks[0].id, kind: .solid, start: 0, duration: 2)
+        solid.color = RGBA(r: 1, g: 0, b: 0, a: 1)
+        solid.transform = ClipTransform(cropLeft: 0.5, maskShape: .circle)
+        p.clips = [solid]
+        var pixelOK = false
+        if let inst = CompositionBuilder.buildInstantInstruction(project: p, media: media, renderSize: p.size) {
+            let frame = TimelineCompositor.compose(inst, at: 0.5, output: p.size) { _, _ in nil }
+            if let cg = TimelineCompositor.context.createCGImage(frame, from: CGRect(origin: .zero, size: p.size)) {
+                let rep = NSBitmapImageRep(cgImage: cg)
+                let leftHalf = rep.colorAt(x: 40, y: 100)?.usingColorSpace(.sRGB)
+                let centerKept = rep.colorAt(x: 150, y: 100)?.usingColorSpace(.sRGB)
+                let cornerMasked = rep.colorAt(x: 102, y: 2)?.usingColorSpace(.sRGB)
+                pixelOK = (leftHalf?.redComponent ?? 1) < 0.05
+                    && (centerKept?.redComponent ?? 0) > 0.9
+                    && (cornerMasked?.redComponent ?? 1) < 0.05
+            }
+        }
+
+        // 4. MCP set_crop + set_mask on draft.
+        let m = EditorModel()
+        m.mutate { $0 = p }
+        let draft = MCPDraft.open(p, model: m)
+        defer { draft.close() }
+        let cropArgs: [String: Any] = ["clip_id": solid.id.uuidString, "left": 0.2, "right": 0.1]
+        let maskArgs: [String: Any] = ["clip_id": solid.id.uuidString, "shape": "roundedRect", "corner_radius": 0.15, "feather": 0.05]
+        _ = try? await MCPTools.call("set_crop", cropArgs, model: m, client: nil, draft: draft)
+        _ = try? await MCPTools.call("set_mask", maskArgs, model: m, client: nil, draft: draft)
+        let afterMCP = draft.project.clip(solid.id)?.transform
+        let mcpOK = abs((afterMCP?.cropLeft ?? 0) - 0.2) < 0.001
+            && abs((afterMCP?.cropRight ?? 0) - 0.1) < 0.001
+            && afterMCP?.maskShape == .roundedRect
+            && abs((afterMCP?.cornerRadius ?? 0) - 0.15) < 0.001
+
+        // 5. Security & Multi-cursor naming checks.
+        let negHTTP = HTTPRequest(Data("POST /mcp HTTP/1.1\r\nContent-Length: -5\r\n\r\n".utf8)) == nil
+        let namesOK = MCPServer.displayName("Grok-Cortador") == "Grok-Cortador"
+            && MCPServer.displayName("gemini-cli") == "Gemini"
+            && MCPServer.displayName("grok") == "Grok"
+
+        // 6. Gemini & Grok Bot connect/disconnect in throwaway home.
+        let tmpHome = FileManager.default.temporaryDirectory.appendingPathComponent("editroom-agents-\(UUID().uuidString)", isDirectory: true)
+        try? FileManager.default.createDirectory(at: tmpHome, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tmpHome) }
+        let ac = AgentConnect()
+        ac.home = tmpHome
+        try? ac.connectGemini()
+        let gemOn = ac.geminiConnected
+        try? ac.disconnectGemini()
+        let gemOff = !ac.geminiConnected
+        try? ac.connectGrok()
+        let grokOn = ac.grokConnected
+        try? ac.disconnectGrok()
+        let grokOff = !ac.grokConnected
+        let connectOK = gemOn && gemOff && grokOn && grokOff
+
+        let good = compat && clampOK && pixelOK && mcpOK && negHTTP && namesOK && connectOK
+        log("CROP_MASK_PRO \(good ? "OK" : "FAIL") compat=\(compat) clamp=\(clampOK) pixel=\(pixelOK) mcp=\(mcpOK) http=\(negHTTP) names=\(namesOK) connect=\(connectOK)")
+        return good
     }
 }

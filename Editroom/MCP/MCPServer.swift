@@ -27,6 +27,11 @@ final class MCPServer: ObservableObject {
             enabled ? start() : stop()
         }
     }
+    /// Instant live edits for external AI & voice agents: applies mutations immediately while gliding
+    /// each agent's cursor in parallel without the 300ms serial animation lock.
+    @Published var instantEdits = UserDefaults.standard.object(forKey: "instantAgentEdits") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(instantEdits, forKey: "instantAgentEdits") }
+    }
 
     private var listener: NWListener?
     private(set) weak var model: EditorModel?
@@ -178,13 +183,25 @@ final class MCPServer: ObservableObject {
         send("200 OK", body, headers: headers)
     }
 
-    /// What to call an agent on its cursor.
+    /// What to call an agent on its cursor. Preserves distinct swarm worker names (e.g. "Grok-Cortador",
+    /// "Gemini-Colorista") while normalizing standard client names ("gemini-cli", "claude-code", etc.).
     static func displayName(_ raw: String) -> String {
-        let s = raw.lowercased()
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return "Agent" }
+        let s = trimmed.lowercased()
+        let genericSuffixes = ["-cli", "-code", "-ai", "-desktop", "-app", "-mcp", "-bridge", "-client"]
+        let isGenericClient = genericSuffixes.contains { s.hasSuffix($0) }
+        // Keep hyphenated swarm worker names intact (e.g., "Grok-Cortador", "Gemini-Colorista").
+        if !isGenericClient, trimmed.contains("-"),
+           (s.hasPrefix("grok-") || s.hasPrefix("gemini-") || s.hasPrefix("claude-") || s.hasPrefix("codex-")) {
+            return trimmed
+        }
         if s.contains("claude") { return "Claude" }
         if s.contains("codex") { return "Codex" }
         if s.contains("chatgpt") || s.contains("openai") { return "ChatGPT" }
-        let words = raw.replacingOccurrences(of: "-", with: " ").replacingOccurrences(of: "_", with: " ")
+        if s.contains("gemini") { return "Gemini" }
+        if s.contains("grok") { return "Grok" }
+        let words = trimmed.replacingOccurrences(of: "-", with: " ").replacingOccurrences(of: "_", with: " ")
         return words.prefix(1).uppercased() + words.dropFirst()
     }
 
@@ -213,6 +230,7 @@ struct HTTPRequest {
             h[line[..<colon].trimmingCharacters(in: .whitespaces).lowercased()] = line[line.index(after: colon)...].trimmingCharacters(in: .whitespaces)
         }
         let length = Int(h["content-length"] ?? "0") ?? 0
+        guard length >= 0 else { return nil }
         let bodyStart = end.upperBound
         guard data.count - (bodyStart - data.startIndex) >= length else { return nil }
         method = String(parts[0])
@@ -287,7 +305,7 @@ enum MCPHandler {
                 if let activity { MagicState.shared.finish(activity: activity) }
                 let edits: Set<String> = ["add_clip", "add_title", "move_clip", "trim_clip", "split_clip", "delete_clips", "set_speed", "set_speed_ramp", "set_captions",
                                           "set_grade", "set_audio", "set_transition", "set_sequence", "add_track", "history", "download_media",
-                                          "set_marker", "delete_markers", "set_in_out", "set_transform", "set_title_style", "freeze_frame",
+                                          "set_marker", "delete_markers", "set_in_out", "set_transform", "set_crop", "set_mask", "set_title_style", "freeze_frame",
                                           "reverse_clip", "detach_audio", "duplicate_clip", "set_track", "add_solid", "set_solid_color"]
                 if let draft, edits.contains(name) { MagicThinking.current?.plan(draft.project) }
             }
@@ -352,6 +370,8 @@ enum MCPHandler {
         case "detach_audio": return on("detaching the sound of", clip())
         case "set_transition": return "adding a transition"
         case "set_transform": return on("framing", clip())
+        case "set_crop": return on("cropping", clip())
+        case "set_mask": return on("masking", clip())
         case "set_title_style": return "styling the title"
         case "set_sequence": return "setting up the sequence"
         case "add_track", "set_track": return "arranging tracks"

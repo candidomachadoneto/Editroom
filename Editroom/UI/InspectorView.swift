@@ -216,7 +216,7 @@ struct InspectorView: View {
                             .foregroundStyle(Theme.text)
                         Spacer()
                         ColorPicker("", selection: Binding(get: { c.color.color }, set: { color in
-                            model.live { p in
+                            model.liveVisual(autoCommit: true) { p in
                                 if let i = p.index(of: c.id) { p.clips[i].color = RGBA(color) }
                             }
                         }), supportsOpacity: false)
@@ -299,6 +299,7 @@ struct InspectorView: View {
         let movable = visual.filter(\.isTransformable)
         if !movable.isEmpty {
             transformSection(movable)
+            cropMaskSection(movable)
         } else if visual.count == 1, visual[0].kind == .text {
             textTransformSection(visual[0])
         }
@@ -341,20 +342,27 @@ struct InspectorView: View {
         let tf = clips[0].transform ?? ClipTransform()
         let w = Double(model.project.width), h = Double(model.project.height)
         let live: (@escaping (inout ClipTransform) -> Void) -> Void = { body in
-            model.live(autoCommit: false) { p in
+            model.liveVisual(autoCommit: false) { p in
                 for i in p.clips.indices where ids.contains(p.clips[i].id) {
                     var t = p.clips[i].transform ?? ClipTransform()
                     body(&t)
+                    t.clampAll()
                     p.clips[i].transform = t.isIdentity ? nil : t
                 }
             }
         }
         let done: (Bool) -> Void = { if !$0 { model.commitLive() } }
-        InspectorSection("Transform", action: tf.isIdentity ? nil : ("Reset", {
+        let hasBasicTransform = abs(tf.scale - 1) > 1e-5 || abs(tf.x) > 1e-5 || abs(tf.y) > 1e-5
+            || abs(tf.rotation) > 1e-5 || abs(tf.opacity - 1) > 1e-5 || tf.flipH || tf.flipV
+        InspectorSection("Transform", action: hasBasicTransform ? ("Reset", {
             model.mutate { p in
-                for i in p.clips.indices where ids.contains(p.clips[i].id) { p.clips[i].transform = nil }
+                for i in p.clips.indices where ids.contains(p.clips[i].id) {
+                    var t = p.clips[i].transform ?? ClipTransform()
+                    t.scale = 1; t.x = 0; t.y = 0; t.rotation = 0; t.opacity = 1; t.flipH = false; t.flipV = false
+                    p.clips[i].transform = t.isIdentity ? nil : t
+                }
             }
-        }), collapsedByDefault: true, marked: !tf.isIdentity) {
+        }) : nil, collapsedByDefault: false, marked: hasBasicTransform) {
             ParamRow(icon: .symbol("arrow.up.left.and.arrow.down.right"), label: "Scale", value: tf.scale * 100,
                      range: 5...1000, logarithmic: true, step: 1, format: Self.percentTenths, onEditing: done,
                      onChange: { v in live { $0.scale = ((v * 10).rounded() / 1000).clamped(to: ClipTransform.scaleRange) } })
@@ -364,6 +372,108 @@ struct InspectorView: View {
             ParamRow(icon: .symbol("arrow.up.and.down"), label: "Y", value: tf.y * h, range: -h...h,
                      step: 1, format: Self.tenths, onEditing: done,
                      onChange: { v in live { $0.y = (v * 10).rounded() / 10 / h } })
+            ParamRow(icon: .symbol("rotate.right"), label: "Rotate", value: tf.rotation, range: -180...180,
+                     step: 1, format: { Self.tenths($0) + "°" }, onEditing: done,
+                     onChange: { v in live { $0.rotation = (v * 10).rounded() / 10 } })
+            ParamRow(icon: .symbol("circle.lefthalf.filled"), label: "Opacity", value: tf.opacity * 100, range: 0...100,
+                     step: 1, format: Self.percentTenths, onEditing: done,
+                     onChange: { v in live { $0.opacity = (v / 100).clamped(to: ClipTransform.opacityRange) } })
+            HStack(spacing: 8) {
+                Chip(label: "Flip H", active: tf.flipH) {
+                    model.mutate { p in
+                        for i in p.clips.indices where ids.contains(p.clips[i].id) {
+                            var t = p.clips[i].transform ?? ClipTransform()
+                            t.flipH.toggle()
+                            p.clips[i].transform = t.isIdentity ? nil : t
+                        }
+                    }
+                }
+                Chip(label: "Flip V", active: tf.flipV) {
+                    model.mutate { p in
+                        for i in p.clips.indices where ids.contains(p.clips[i].id) {
+                            var t = p.clips[i].transform ?? ClipTransform()
+                            t.flipV.toggle()
+                            p.clips[i].transform = t.isIdentity ? nil : t
+                        }
+                    }
+                }
+                Spacer()
+            }
+        }
+    }
+
+    @ViewBuilder private func cropMaskSection(_ clips: [Clip]) -> some View {
+        let ids = Set(clips.map(\.id))
+        let tf = clips[0].transform ?? ClipTransform()
+        let live: (@escaping (inout ClipTransform) -> Void) -> Void = { body in
+            model.liveVisual(autoCommit: false) { p in
+                for i in p.clips.indices where ids.contains(p.clips[i].id) {
+                    var t = p.clips[i].transform ?? ClipTransform()
+                    body(&t)
+                    t.clampAll()
+                    p.clips[i].transform = t.isIdentity ? nil : t
+                }
+            }
+        }
+        let done: (Bool) -> Void = { if !$0 { model.commitLive() } }
+        let active = tf.hasCrop || tf.hasMask
+        InspectorSection("Crop & Mask", action: active ? ("Reset", {
+            model.mutate { p in
+                for i in p.clips.indices where ids.contains(p.clips[i].id) {
+                    var t = p.clips[i].transform ?? ClipTransform()
+                    t.cropLeft = 0; t.cropRight = 0; t.cropTop = 0; t.cropBottom = 0
+                    t.maskShape = .none; t.cornerRadius = 0; t.maskFeather = 0
+                    p.clips[i].transform = t.isIdentity ? nil : t
+                }
+            }
+        }) : nil, collapsedByDefault: !active, marked: active) {
+            ParamRow(icon: .symbol("arrow.right.to.line"), label: "Left", value: tf.cropLeft * 100,
+                     range: 0...95, step: 1, format: Self.percentTenths, onEditing: done,
+                     onChange: { v in live { $0.cropLeft = (v / 100).clamped(to: 0...max(0, 0.95 - $0.cropRight)) } })
+            ParamRow(icon: .symbol("arrow.left.to.line"), label: "Right", value: tf.cropRight * 100,
+                     range: 0...95, step: 1, format: Self.percentTenths, onEditing: done,
+                     onChange: { v in live { $0.cropRight = (v / 100).clamped(to: 0...max(0, 0.95 - $0.cropLeft)) } })
+            ParamRow(icon: .symbol("arrow.down.to.line"), label: "Top", value: tf.cropTop * 100,
+                     range: 0...95, step: 1, format: Self.percentTenths, onEditing: done,
+                     onChange: { v in live { $0.cropTop = (v / 100).clamped(to: 0...max(0, 0.95 - $0.cropBottom)) } })
+            ParamRow(icon: .symbol("arrow.up.to.line"), label: "Bottom", value: tf.cropBottom * 100,
+                     range: 0...95, step: 1, format: Self.percentTenths, onEditing: done,
+                     onChange: { v in live { $0.cropBottom = (v / 100).clamped(to: 0...max(0, 0.95 - $0.cropTop)) } })
+            HStack(spacing: 8) {
+                Image(systemName: "square.on.circle")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(Theme.textDim)
+                    .frame(width: 18)
+                Text("Mask")
+                    .font(.system(size: 11.5))
+                    .foregroundStyle(Theme.text)
+                    .frame(width: 52, alignment: .leading)
+                MenuField(label: tf.maskShape.label, height: 26) {
+                    ForEach(MaskShape.allCases, id: \.self) { shape in
+                        Button(shape.label) {
+                            model.mutate { p in
+                                for i in p.clips.indices where ids.contains(p.clips[i].id) {
+                                    var t = p.clips[i].transform ?? ClipTransform()
+                                    t.maskShape = shape
+                                    if shape == .roundedRect && t.cornerRadius < 0.01 { t.cornerRadius = 0.1 }
+                                    if shape == .none { t.cornerRadius = 0; t.maskFeather = 0 }
+                                    p.clips[i].transform = t.isIdentity ? nil : t
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if tf.maskShape == .roundedRect || tf.cornerRadius > 0 {
+                ParamRow(icon: .symbol("square.dashed"), label: "Radius", value: tf.cornerRadius * 100,
+                         range: 0...50, step: 1, format: Self.percentTenths, onEditing: done,
+                         onChange: { v in live { $0.cornerRadius = (v / 100).clamped(to: ClipTransform.radiusRange); if $0.cornerRadius > 0 && $0.maskShape == .none { $0.maskShape = .roundedRect } } })
+            }
+            if tf.hasMask {
+                ParamRow(icon: .symbol("aqi.medium"), label: "Feather", value: tf.maskFeather * 100,
+                         range: 0...25, step: 0.5, format: Self.percentTenths, onEditing: done,
+                         onChange: { v in live { $0.maskFeather = (v / 100).clamped(to: ClipTransform.featherRange) } })
+            }
         }
     }
 
@@ -479,7 +589,7 @@ struct InspectorView: View {
         let ids = Set(clips.map(\.id))
         let grade = clips[0].grade ?? ColorGrade()
         let live: (@escaping (inout ColorGrade) -> Void) -> Void = { body in
-            model.live(autoCommit: false) { p in
+            model.liveVisual(autoCommit: false) { p in
                 for i in p.clips.indices where ids.contains(p.clips[i].id) {
                     var g = p.clips[i].grade ?? ColorGrade()
                     body(&g)
@@ -594,7 +704,7 @@ struct InspectorView: View {
         let w = Double(model.project.width), h = Double(model.project.height)
         let centred = abs(c.text.x - 0.5) < 1e-6 && abs(c.text.y - 0.5) < 1e-6
         let update: (@escaping (inout TextStyle) -> Void) -> Void = { body in
-            model.live(autoCommit: false) { p in
+            model.liveVisual(autoCommit: false) { p in
                 if let i = p.index(of: c.id) { body(&p.clips[i].text) }
             }
         }

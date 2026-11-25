@@ -30,7 +30,7 @@ struct MagicPopover: View {
                 .padding(.top, 12)
         }
         .padding(14)
-        .frame(width: 380)
+        .frame(width: 444)
         .background(Theme.panel)
         .onAppear { connections.refresh() }
         .onChange(of: ai.available) { _, now in
@@ -47,16 +47,14 @@ struct MagicPopover: View {
         if let kind = ai.tab.kind {
             if justConnected == kind {
                 Centered(logo: AppLogo(kind: kind, size: 36), title: "\(kind.name) is connected",
-                         text: kind == .claude ? "Tell it what to make. You can disconnect any time in AI Agents."
-                                               : "Tell it what to make. To edit from the ChatGPT app as well, quit and reopen it once.") {
+                         text: connectedBlurb(kind)) {
                     PillButton(title: "Continue", prominent: true) { justConnected = nil }
                 }
             } else if !ai.installed(kind) {
-                Centered(logo: AppLogo(kind: kind, size: 36), title: "Get the \(kind.name) app",
-                         text: kind == .claude ? "Claude edits for you through the Claude app on this Mac. Install it, then come back to connect."
-                                               : "ChatGPT edits for you through Codex in the ChatGPT app on this Mac. Install it, then come back to connect.") {
+                Centered(logo: AppLogo(kind: kind, size: 36), title: "Get \(kind.name)",
+                         text: installBlurb(kind)) {
                     PillButton(title: "Download \(kind.name)", prominent: true) {
-                        if let url = (kind == .claude ? AgentApp.claude : AgentApp.chatgpt).download { NSWorkspace.shared.open(url) }
+                        if let url = app(for: kind).download { NSWorkspace.shared.open(url) }
                     }
                 }
             } else if kind == .claude, connections.states[.claude] == .waiting {
@@ -72,8 +70,7 @@ struct MagicPopover: View {
                 }
             } else if !ai.connected(kind) {
                 Centered(logo: AppLogo(kind: kind, size: 36), title: "Connect \(kind.name)",
-                         text: kind == .claude ? "Let Claude edit for you, with your Claude plan. Nothing is shared until you ask it to make an edit."
-                                               : "Let ChatGPT edit for you, with your ChatGPT plan. It works through Codex in the ChatGPT app.") {
+                         text: connectBlurb(kind)) {
                     VStack(spacing: 7) {
                         PillButton(title: "Connect \(kind.name)", prominent: true) { connect(kind) }
                         Text("No API key needed").font(.system(size: 10.5)).foregroundStyle(Theme.textFaint)
@@ -83,14 +80,16 @@ struct MagicPopover: View {
                     Text(why).font(.system(size: 11)).foregroundStyle(Color(hex: 0xE5735C)).frame(maxWidth: .infinity).padding(.top, 6)
                 }
             } else if !ai.runnable(kind) {
-                // Connected for use from the Claude app, but Magic runs Claude Code, which the Claude
-                // app installs the first time its Code tab is opened.
-                Centered(logo: AppLogo(kind: kind, size: 36), title: "Open Claude Code once",
-                         text: "Magic uses Claude Code, which comes with the Claude app. Open the Claude app's Code tab once, then come back.") {
-                    PillButton(title: "Open Claude", prominent: true) {
-                        if let url = AgentConnect.appURL(AgentConnect.claudeBundleID) {
-                            NSWorkspace.shared.openApplication(at: url, configuration: NSWorkspace.OpenConfiguration())
+                Centered(logo: AppLogo(kind: kind, size: 36), title: runnableTitle(kind),
+                         text: runnableBlurb(kind)) {
+                    if kind == .claude {
+                        PillButton(title: "Open Claude", prominent: true) {
+                            if let url = AgentConnect.appURL(AgentConnect.claudeBundleID) {
+                                NSWorkspace.shared.openApplication(at: url, configuration: NSWorkspace.OpenConfiguration())
+                            }
                         }
+                    } else if let url = app(for: kind).download {
+                        PillButton(title: "Install \(kind.name) CLI", prominent: true) { NSWorkspace.shared.open(url) }
                     }
                 }
             } else {
@@ -153,11 +152,58 @@ struct MagicPopover: View {
 
     // MARK: Actions
 
+    private func connectedBlurb(_ kind: MagicAgent.Kind) -> String {
+        switch kind {
+        case .claude: "Tell it what to make. You can disconnect any time in AI Agents."
+        case .chatgpt: "Tell it what to make. To edit from the ChatGPT app as well, quit and reopen it once."
+        case .gemini: "Tell Gemini what to edit, or command Editroom straight from Gemini CLI."
+        case .grok: "Tell Grok what to edit, or speak directly to Grok Bot for live instant voice editing."
+        }
+    }
+
+    private func installBlurb(_ kind: MagicAgent.Kind) -> String {
+        switch kind {
+        case .claude: "Claude edits for you through the Claude app on this Mac. Install it, then come back to connect."
+        case .chatgpt: "ChatGPT edits for you through Codex in the ChatGPT app on this Mac. Install it, then come back to connect."
+        case .gemini: "Gemini edits for you through Gemini CLI on this Mac. Install it, then come back to connect."
+        case .grok: "Grok edits for you through Grok Bot & Voice Director on this Mac. Install it, then come back to connect."
+        }
+    }
+
+    private func connectBlurb(_ kind: MagicAgent.Kind) -> String {
+        switch kind {
+        case .claude: "Let Claude edit for you, with your Claude plan. Nothing is shared until you ask it to make an edit."
+        case .chatgpt: "Let ChatGPT edit for you, with your ChatGPT plan. It works through Codex in the ChatGPT app."
+        case .gemini: "Connect Gemini CLI (~/.gemini/settings.json) to edit directly in Editroom."
+        case .grok: "Connect Grok Bot & Voice Director (~/.grok/config.toml) for instant voice & multi-agent editing."
+        }
+    }
+
+    private func runnableTitle(_ kind: MagicAgent.Kind) -> String {
+        switch kind {
+        case .claude: "Open Claude Code once"
+        case .chatgpt: "Install Codex CLI"
+        case .gemini: "Install Gemini CLI"
+        case .grok: "Install Grok CLI"
+        }
+    }
+
+    private func runnableBlurb(_ kind: MagicAgent.Kind) -> String {
+        switch kind {
+        case .claude: "Magic uses Claude Code, which comes with the Claude app. Open the Claude app's Code tab once, then come back."
+        case .chatgpt: "Magic needs Codex on this Mac to run edits inside the popover."
+        case .gemini: "Magic runs Gemini CLI (`gemini`) in your PATH to make edits."
+        case .grok: "Grok Bot can still edit over MCP/Voice; install `grok` CLI to run Magic prompts here too."
+        }
+    }
+
     private func app(for kind: MagicAgent.Kind) -> AgentApp {
         switch kind {
         case .chatgpt: .chatgpt
         // The Claude app's extension; Claude Code when there's no Claude app.
         case .claude: AgentConnect.appURL(AgentConnect.claudeBundleID) != nil ? .claude : .claudeCode
+        case .gemini: .gemini
+        case .grok: .grokBot
         }
     }
 
@@ -185,7 +231,13 @@ struct MagicPopover: View {
 
     private func go(_ kind: MagicAgent.Kind) {
         close()
-        model.addMagicPrompt(request, tab: kind == .claude ? .claude : .chatgpt)
+        let tab: MagicAgent.Tab = switch kind {
+        case .claude: .claude
+        case .chatgpt: .chatgpt
+        case .gemini: .gemini
+        case .grok: .grok
+        }
+        model.addMagicPrompt(request, tab: tab)
         ai.start(request: request, with: kind, model: model)
         request = ""
     }
@@ -246,7 +298,12 @@ struct AppLogo: View {
     let size: CGFloat
 
     private var icon: NSImage? {
-        let ids = kind == .claude ? [AgentConnect.claudeBundleID] : AgentConnect.chatgptBundleIDs
+        let ids: [String] = switch kind {
+        case .claude: [AgentConnect.claudeBundleID]
+        case .chatgpt: AgentConnect.chatgptBundleIDs
+        case .gemini: []
+        case .grok: [AgentConnect.grokBundleID]
+        }
         guard let url = ids.lazy.compactMap(AgentConnect.appURL).first else { return nil }
         return NSWorkspace.shared.icon(forFile: url.path)
     }
@@ -255,12 +312,29 @@ struct AppLogo: View {
         if let icon {
             Image(nsImage: icon).resizable().interpolation(.high).frame(width: size, height: size)
         } else {
+            let fill: Color = switch kind {
+            case .claude: Color(hex: 0xD97757)
+            case .chatgpt: Color(hex: 0xF2F2F0)
+            case .gemini: Color(hex: 0x4285F4)
+            case .grok: Color(hex: 0x111827)
+            }
+            let symbol: String = switch kind {
+            case .claude: "asterisk"
+            case .chatgpt: "circle.dashed"
+            case .gemini: "sparkles"
+            case .grok: "waveform"
+            }
+            let fg: Color = switch kind {
+            case .chatgpt: .black
+            case .grok: Color(hex: 0x22D3EE)
+            default: .white
+            }
             RoundedRectangle(cornerRadius: size * 0.24, style: .continuous)
-                .fill(kind == .claude ? Color(hex: 0xD97757) : Color(hex: 0xF2F2F0))
+                .fill(fill)
                 .frame(width: size, height: size)
-                .overlay(Image(systemName: kind == .claude ? "asterisk" : "circle.dashed")
+                .overlay(Image(systemName: symbol)
                     .font(.system(size: size * 0.5, weight: .bold))
-                    .foregroundStyle(kind == .claude ? .white : .black))
+                    .foregroundStyle(fg))
         }
     }
 }
@@ -957,24 +1031,26 @@ private struct EffortChip: View {
 
     var body: some View {
         let efforts = ai.models(for: kind).first { $0.id == ai.model(for: kind) }?.efforts ?? []
-        Menu {
-            Picker("Effort", selection: Binding(
-                get: { ai.effort(for: kind) },
-                set: { ai.setModel(ai.model(for: kind), effort: $0, for: kind) })) {
-                ForEach(efforts, id: \.self) { e in
-                    let blurb = MagicAgent.effortBlurb(e)
-                    Text(MagicAgent.effortName(e)).badge(blurb.isEmpty ? nil : Text(blurb)).tag(e)
+        if !efforts.isEmpty {
+            Menu {
+                Picker("Effort", selection: Binding(
+                    get: { ai.effort(for: kind) },
+                    set: { ai.setModel(ai.model(for: kind), effort: $0, for: kind) })) {
+                    ForEach(efforts, id: \.self) { e in
+                        let blurb = MagicAgent.effortBlurb(e)
+                        Text(MagicAgent.effortName(e)).badge(blurb.isEmpty ? nil : Text(blurb)).tag(e)
+                    }
                 }
+                .pickerStyle(.inline)
+            } label: {
+                ChipLabel(symbol: "gauge.with.dots.needle.33percent", title: MagicAgent.effortName(ai.effort(for: kind)))
             }
-            .pickerStyle(.inline)
-        } label: {
-            ChipLabel(symbol: "gauge.with.dots.needle.33percent", title: MagicAgent.effortName(ai.effort(for: kind)))
+            .menuStyle(.button)
+            .buttonStyle(.plain)
+            .menuIndicator(.hidden)
+            .fixedSize()
+            .help("How hard \(kind.name) thinks: higher is slower and uses more of your plan")
         }
-        .menuStyle(.button)
-        .buttonStyle(.plain)
-        .menuIndicator(.hidden)
-        .fixedSize()
-        .help("How hard \(kind.name) thinks: higher is slower and uses more of your plan")
     }
 }
 

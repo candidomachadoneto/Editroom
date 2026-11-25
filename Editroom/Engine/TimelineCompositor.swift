@@ -1,6 +1,38 @@
 import AVFoundation
+import CoreGraphics
 import CoreImage
 import Metal
+
+/// Thread-safe cache of the most recently decoded raw source frames at a timeline time,
+/// allowing instant (<5ms) GPU re-compositing during interactive drag/crop/transform/grade edits
+/// without rebuilding AVMutableComposition or seeking AVPlayer.
+final class LiveFrameCache: @unchecked Sendable {
+    private let lock = NSLock()
+    private var cachedTime: Double = -1
+    private var frames: [UUID: CIImage] = [:]
+
+    func store(time: Double, frames newFrames: [UUID: CIImage]) {
+        guard !newFrames.isEmpty else { return }
+        lock.lock()
+        cachedTime = time
+        frames = newFrames
+        lock.unlock()
+    }
+
+    func lookup(time: Double, tolerance: Double = 0.02) -> [UUID: CIImage]? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !frames.isEmpty, abs(cachedTime - time) <= tolerance else { return nil }
+        return frames
+    }
+
+    func clear() {
+        lock.lock()
+        cachedTime = -1
+        frames.removeAll()
+        lock.unlock()
+    }
+}
 
 /// Where a video layer's picture comes from in its file, for showing it from the scrub frames.
 struct ScrubSource {
@@ -29,6 +61,7 @@ struct RenderLayer {
         case decoded(ReverseFrames, CGImagePropertyOrientation, limit: Int, clock: SourceClock)
     }
 
+    let clipID: UUID
     /// When the layer is drawn: the clip, plus any extra a transition shows before or after it.
     let start: Double
     let end: Double
@@ -52,6 +85,7 @@ struct RenderLayer {
 
     init(clip: Clip, source: Source, cube: Data? = nil, color: SourceColor = .standard, plan: TransitionPlan = TransitionPlan(),
          scrub: ScrubSource? = nil) {
+        self.clipID = clip.id
         self.scrub = scrub
         self.cube = cube
         self.color = color
@@ -104,14 +138,17 @@ final class TimelineInstruction: NSObject, AVVideoCompositionInstructionProtocol
     let offset: CGPoint
     /// Captions, drawn over everything in the output's own frame.
     let captions: [CaptionLayer]
+    /// True only for live player renders so exports and get_frame never pollute LiveFrameCache.
+    let cacheLiveFrames: Bool
 
     init(timeRange: CMTimeRange, layers: [RenderLayer], trackIDs: [CMPersistentTrackID], canvas: CGSize, offset: CGPoint = .zero,
-         captions: [CaptionLayer] = []) {
+         captions: [CaptionLayer] = [], cacheLiveFrames: Bool = false) {
         self.timeRange = timeRange
         self.canvas = canvas
         self.offset = offset
         self.layers = layers
         self.captions = captions
+        self.cacheLiveFrames = cacheLiveFrames
         self.requiredSourceTrackIDs = trackIDs.map { NSNumber(value: $0) }
     }
 }
@@ -190,9 +227,13 @@ final class TimelineCompositor: NSObject, AVVideoCompositing {
         }
     }
 
+    static let liveFrameCache = LiveFrameCache()
+
     private static func compose(_ instruction: TimelineInstruction, request: AVAsynchronousVideoCompositionRequest) -> CIImage {
         let t = request.compositionTime.seconds + 1e-4
-        return compose(instruction, at: t, output: request.renderContext.size) { _, layer in
+        let shouldCache = instruction.cacheLiveFrames
+        var captured: [UUID: CIImage] = [:]
+        let result = compose(instruction, at: t, output: request.renderContext.size) { _, layer in
             let buffer: CVPixelBuffer?
             switch layer.source {
             case .track(let id, _): buffer = request.sourceFrame(byTrackID: id)
@@ -200,8 +241,68 @@ final class TimelineCompositor: NSObject, AVVideoCompositing {
             case .decoded(let frames, _, let limit, let clock): buffer = frames.frame(at: clock.source(at: t - 1e-4), limit: limit)
             default: buffer = nil
             }
-            return buffer.map { CIImage(cvPixelBuffer: $0) }
+            if let buffer {
+                let img = CIImage(cvPixelBuffer: buffer)
+                if shouldCache { captured[layer.clipID] = img }
+                return img
+            }
+            return nil
         }
+        if shouldCache, !captured.isEmpty {
+            liveFrameCache.store(time: request.compositionTime.seconds, frames: captured)
+        }
+        return result
+    }
+
+    /// Generates an alpha mask image for a cropped rectangle (`yUp` Core Image coordinates).
+    private static func makeMask(rect: CGRect, shape: MaskShape, cornerRadius: Double, feather: Double) -> CIImage? {
+        let w = Int(ceil(rect.width)), h = Int(ceil(rect.height))
+        guard w > 0, h > 0 else { return nil }
+        let effectiveShape: MaskShape = (shape == .none && cornerRadius > 1e-5) ? .roundedRect : shape
+        let shortSide = min(rect.width, rect.height)
+        let featherPx = CGFloat(feather.clamped(to: ClipTransform.featherRange)) * shortSide
+        // Keep sigma <= 0.4 * inset so the Gaussian tail decays below 0.5% before reaching rect's edge
+        // (eliminating any hard rectangular cutoff seam).
+        let blurRadius = featherPx > 0.5 ? featherPx * 0.4 : 0
+        let inset = featherPx > 0.5 ? min(shortSide * 0.45, max(featherPx, blurRadius * 2.5)) : 0
+
+        let colorSpace = CGColorSpaceCreateDeviceGray()
+        guard let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w,
+                                  space: colorSpace, bitmapInfo: CGImageAlphaInfo.none.rawValue) else { return nil }
+        ctx.setFillColor(gray: 0, alpha: 1)
+        ctx.fill(CGRect(x: 0, y: 0, width: w, height: h))
+        ctx.setFillColor(gray: 1, alpha: 1)
+
+        let drawBounds = CGRect(x: inset, y: inset, width: max(1, CGFloat(w) - inset * 2), height: max(1, CGFloat(h) - inset * 2))
+        switch effectiveShape {
+        case .none:
+            ctx.fill(drawBounds)
+        case .roundedRect:
+            let r = min(drawBounds.width, drawBounds.height) * CGFloat(cornerRadius.clamped(to: ClipTransform.radiusRange))
+            let path = CGPath(roundedRect: drawBounds, cornerWidth: r, cornerHeight: r, transform: nil)
+            ctx.addPath(path)
+            ctx.fillPath()
+        case .ellipse:
+            ctx.fillEllipse(in: drawBounds)
+        case .circle:
+            let side = min(drawBounds.width, drawBounds.height)
+            let square = CGRect(x: (CGFloat(w) - side) / 2, y: (CGFloat(h) - side) / 2, width: side, height: side)
+            ctx.fillEllipse(in: square)
+        }
+
+        guard let cg = ctx.makeImage() else { return nil }
+        var mask = CIImage(cgImage: cg)
+            .transformed(by: CGAffineTransform(translationX: rect.minX, y: rect.minY))
+        if blurRadius > 0.25 {
+            // Composite over black padding (never clampedToExtent, which smears non-zero border pixels).
+            let pad = ceil(blurRadius * 3)
+            let paddedRect = rect.insetBy(dx: -pad, dy: -pad)
+            let black = CIImage(color: .black).cropped(to: paddedRect)
+            mask = mask.composited(over: black)
+                .applyingFilter("CIGaussianBlur", parameters: [kCIInputRadiusKey: blurRadius])
+                .cropped(to: rect)
+        }
+        return mask
     }
 
     /// The frame at timeline time `t`: every layer showing then, bottom first. `picture` gives a video
@@ -213,9 +314,11 @@ final class TimelineCompositor: NSObject, AVVideoCompositing {
         var out = CIImage(color: .black).cropped(to: frame)
 
         for (index, layer) in instruction.layers.enumerated() where t >= layer.start && t < layer.end {
-            let opacity = layer.opacity(at: t)
+            let clipOpacity = layer.transform?.opacity ?? 1.0
+            let opacity = layer.opacity(at: t) * clipOpacity
             if opacity <= 0.001 { continue }
             var image: CIImage
+            let baseRect: CGRect
             switch layer.source {
             case .track(_, let orientation), .reversed(_, let orientation, _, _, _), .decoded(_, let orientation, _, _):
                 guard var src = picture(index, layer) else { continue }
@@ -226,23 +329,47 @@ final class TimelineCompositor: NSObject, AVVideoCompositing {
                 let tx = (size.width - e.width * s) / 2 - e.minX * s
                 let ty = (size.height - e.height * s) / 2 - e.minY * s
                 image = src.transformed(by: CGAffineTransform(a: s, b: 0, c: 0, d: s, tx: tx, ty: ty))
+                baseRect = CGRect(x: (size.width - e.width * s) / 2, y: (size.height - e.height * s) / 2,
+                                  width: e.width * s, height: e.height * s)
                 // After scaling, so a 4K source is converted at the output's size.
                 image = layer.color.toRec709(image)
             case .image(let img):
                 image = img
+                baseRect = img.extent.isInfinite ? frame : img.extent
             case .color(let color):
                 image = CIImage(color: color).cropped(to: frame)
+                baseRect = frame
             }
             if let w = layer.wipe(at: t) {
                 image = image.cropped(to: CGRect(x: 0, y: 0, width: size.width * w, height: size.height))
             }
             if let tf = layer.transform {
-                // Scale about the frame's centre, then offset (Core Image's y runs up).
-                let cx = size.width / 2, cy = size.height / 2
-                let m = CGAffineTransform(translationX: -cx, y: -cy)
-                    .concatenating(CGAffineTransform(scaleX: tf.scale, y: tf.scale))
-                    .concatenating(CGAffineTransform(translationX: cx + tf.x * size.width, y: cy - tf.y * size.height))
-                image = image.transformed(by: m)
+                // 1. Flip H/V about the fitted clip's centre.
+                if tf.flipH || tf.flipV {
+                    let bcx = baseRect.midX, bcy = baseRect.midY
+                    let flip = CGAffineTransform(translationX: -bcx, y: -bcy)
+                        .concatenating(CGAffineTransform(scaleX: tf.flipH ? -1 : 1, y: tf.flipV ? -1 : 1))
+                        .concatenating(CGAffineTransform(translationX: bcx, y: bcy))
+                    image = image.transformed(by: flip)
+                }
+                // 2. Real 4-side crop in fitted clip space.
+                let cropRect = tf.croppedRect(in: baseRect, yUp: true)
+                if tf.hasCrop {
+                    image = image.cropped(to: cropRect)
+                }
+                // 3. Mask (rounded corners / ellipse / circle + feather) inside cropped rect.
+                if tf.hasMask, let mask = makeMask(rect: cropRect, shape: tf.maskShape,
+                                                   cornerRadius: tf.cornerRadius, feather: tf.maskFeather) {
+                    let clear = CIImage(color: .clear).cropped(to: cropRect)
+                    image = image.applyingFilter("CIBlendWithMask", parameters: [
+                        kCIInputBackgroundImageKey: clear,
+                        kCIInputMaskImageKey: mask,
+                    ]).cropped(to: cropRect)
+                }
+                // 4. Scale, rotate and offset using the shared transform matrix (Preview == Export == HitTest).
+                if abs(tf.scale - 1) > 1e-6 || abs(tf.rotation) > 1e-6 || abs(tf.x) > 1e-6 || abs(tf.y) > 1e-6 {
+                    image = image.transformed(by: tf.affine(canvasSize: size, yUp: true))
+                }
             }
             if let cube = layer.cube {
                 image = image.applyingFilter("CIColorCube", parameters: [

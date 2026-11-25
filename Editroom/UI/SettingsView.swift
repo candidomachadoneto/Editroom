@@ -533,7 +533,7 @@ private struct MagicSettings: View {
 
     /// Claude Code only when it's on this Mac.
     private var apps: [AgentApp] {
-        [.claude, .chatgpt, .claudeCode].filter { $0 != .claudeCode || connect.states[$0] != .missing }
+        [.claude, .chatgpt, .gemini, .grokBot, .claudeCode].filter { $0 != .claudeCode || connect.states[$0] != .missing }
     }
 
     var body: some View {
@@ -543,7 +543,7 @@ private struct MagicSettings: View {
                     SectionLabel(text: "Magic")
                     VStack(spacing: 0) {
                         ToggleRow(title: "Enable Magic",
-                                  note: "Magic makes an edit for you: a quick cut on this Mac, or one Claude or ChatGPT works out from what you ask. Off hides the Magic button.",
+                                  note: "Magic makes an edit for you: a quick cut on this Mac, or one Claude, ChatGPT, Gemini or Grok Bot works out from what you ask. Off hides the Magic button.",
                                   isOn: $magicEnabled, boxed: false)
                         Divider().overlay(Theme.stroke)
                         ToggleRow(title: "Show Magic at work",
@@ -556,7 +556,7 @@ private struct MagicSettings: View {
                 }
 
                 VStack(alignment: .leading, spacing: 8) {
-                    SectionLabel(text: "AI apps")
+                    SectionLabel(text: "AI & Voice apps")
                     VStack(spacing: 0) {
                         ForEach(Array(apps.enumerated()), id: \.element) { i, app in
                             if i > 0 { Divider().overlay(Theme.stroke).padding(.leading, 58) }
@@ -564,7 +564,7 @@ private struct MagicSettings: View {
                         }
                     }
                     .background(RoundedRectangle(cornerRadius: 9, style: .continuous).fill(Theme.field))
-                    Text("Connected apps use your own Claude or ChatGPT plan; no API key needed. Disconnecting stops Editroom answering that app, for Magic and for edits you ask for in the app.")
+                    Text("Connected apps use your own Claude, ChatGPT, Gemini or Grok Bot plan; no API key needed. Disconnecting stops Editroom answering that app, for Magic and for live voice/MCP edits.")
                         .font(.system(size: 11))
                         .foregroundStyle(Theme.textFaint)
                         .fixedSize(horizontal: false, vertical: true)
@@ -572,11 +572,22 @@ private struct MagicSettings: View {
 
                 VStack(alignment: .leading, spacing: 8) {
                     SectionLabel(text: "Editing from other apps")
-                    ToggleRow(title: "Let AI apps edit in Editroom",
-                              note: server.enabled
-                                ? "On: connected apps can edit here, with their own cursor, and every change can be undone. Only apps on this Mac can reach Editroom."
-                                : "Off: no app can reach Editroom, and Magic only makes quick cuts on this Mac.",
-                              isOn: $server.enabled)
+                    VStack(spacing: 0) {
+                        ToggleRow(title: "Let AI apps edit in Editroom",
+                                  note: server.enabled
+                                    ? "On: connected apps and voice directors can edit here, with their own cursor, and every change can be undone. Only apps on this Mac can reach Editroom."
+                                    : "Off: no app can reach Editroom, and Magic only makes quick cuts on this Mac.",
+                                  isOn: $server.enabled, boxed: false)
+                        Divider().overlay(Theme.stroke)
+                        ToggleRow(title: "Instant feedback for AI & Voice agents",
+                                  note: server.instantEdits
+                                    ? "On: edits from Grok Bot, Gemini, Claude and multi-agent swarms apply immediately (<16ms preview) while cursors glide live in parallel."
+                                    : "Off: plays each external edit sequentially with full cursor animations.",
+                                  isOn: $server.instantEdits, boxed: false)
+                            .disabled(!server.enabled)
+                            .opacity(server.enabled ? 1 : 0.4)
+                    }
+                    .background(RoundedRectangle(cornerRadius: 9, style: .continuous).fill(Theme.field))
                     if let problem = server.problem, server.enabled {
                         Text(problem).font(.system(size: 11.5)).foregroundStyle(Color(hex: 0xE5735C))
                     }
@@ -646,6 +657,8 @@ private struct AppRow: View {
         let id: String? = switch app {
         case .claude, .claudeCode: AgentConnect.claudeBundleID
         case .chatgpt: AgentConnect.chatgptBundleIDs.first { AgentConnect.appURL($0) != nil }
+        case .gemini: nil
+        case .grokBot: AgentConnect.grokBundleID
         }
         guard let id, let url = AgentConnect.appURL(id) else { return nil }
         return NSWorkspace.shared.icon(forFile: url.path)
@@ -664,6 +677,13 @@ private struct AppRow: View {
         case (.claude, .connected): "Connected. Claude can edit here, and Magic can use it."
         case (.chatgpt, .ready): "Adds Editroom to Codex in the ChatGPT app."
         case (.chatgpt, .connected): "Connected. ChatGPT can edit here, and Magic can use it."
+        case (.gemini, .ready): "Adds Editroom to Gemini CLI (~/.gemini/settings.json)."
+        case (.gemini, .connected): "Connected. Gemini can edit here, and Magic can use it."
+        case (.grokBot, .ready): "Adds Editroom to Grok Bot & Voice Director (~/.grok/config.toml)."
+        case (.grokBot, .connected):
+            connect.grokSwarmOnline
+                ? "Connected · Voice Swarm online (127.0.0.1:7842) for live voice editing."
+                : "Connected. Grok Bot & Voice Director can edit here, and Magic can use it."
         case (.claudeCode, .ready): "Adds Editroom to Claude Code for all your projects."
         case (.claudeCode, .connected): "Connected. New Claude Code sessions can edit here."
         default: ""
@@ -673,7 +693,17 @@ private struct AppRow: View {
     var body: some View {
         HStack(spacing: 12) {
             Group {
-                if let icon { Image(nsImage: icon).resizable() } else {
+                if let icon {
+                    Image(nsImage: icon).resizable()
+                } else if app == .gemini {
+                    RoundedRectangle(cornerRadius: 7, style: .continuous)
+                        .fill(Color(hex: 0x4285F4))
+                        .overlay(Image(systemName: "sparkles").font(.system(size: 14, weight: .bold)).foregroundStyle(.white))
+                } else if app == .grokBot {
+                    RoundedRectangle(cornerRadius: 7, style: .continuous)
+                        .fill(Color(hex: 0x111827))
+                        .overlay(Image(systemName: "waveform").font(.system(size: 14, weight: .bold)).foregroundStyle(Color(hex: 0x22D3EE)))
+                } else {
                     RoundedRectangle(cornerRadius: 7).fill(Theme.raised)
                 }
             }
@@ -765,7 +795,7 @@ private struct UpdateSettings: View {
                             .foregroundStyle(Theme.textDim)
                             .fixedSize(horizontal: false, vertical: true)
                         PillButton(title: "View GitHub Releases", prominent: false) {
-                            NSWorkspace.shared.open(URL(string: "https://github.com/robbietilton/Editroom/releases")!)
+                            NSWorkspace.shared.open(URL(string: "https://github.com/candidomachadoneto/Editroom/releases")!)
                         }
                     }
                 }

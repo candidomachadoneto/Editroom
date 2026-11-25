@@ -63,6 +63,38 @@ struct PreviewView: View {
     @State private var moveStart: (x: Double, y: Double)?
     /// Viewer magnification; nil fits the frame to the space available.
     @State private var zoom: Double?
+    /// Active interactive handle on the selected clip's canvas bounding box.
+    @State private var canvasDrag: CanvasDragState?
+    /// Magnetic guide lines flashed while dragging/rotating on the canvas.
+    @State private var guides = SnapGuides()
+    /// Live HUD badge shown while dragging/scaling/cropping/rotating on the canvas.
+    @State private var hudText: String?
+
+    private struct SnapGuides: Equatable {
+        var centerX = false
+        var centerY = false
+        var leftEdge = false
+        var rightEdge = false
+        var topEdge = false
+        var bottomEdge = false
+    }
+
+    private enum CanvasHandle: Equatable {
+        case body
+        case topLeft, topRight, bottomLeft, bottomRight
+        case cropLeft, cropRight, cropTop, cropBottom
+        case rotate
+    }
+
+    private struct CanvasDragState {
+        let clipID: UUID
+        let handle: CanvasHandle
+        let initial: ClipTransform
+        let baseRect: CGRect
+        let initialAffine: CGAffineTransform
+        let startPoint: CGPoint
+        let startAngle: Double
+    }
 
     init(model: EditorModel) {
         self.model = model
@@ -70,17 +102,60 @@ struct PreviewView: View {
         self.source = model.sourcePreview
     }
 
-    /// The one visual clip in the selection, which dragging in the viewer moves.
+    /// The one visual clip in the selection, which dragging in the viewer moves/crops/scales/rotates.
     private var target: Clip? {
         let visual = model.selection.compactMap { model.project.clip($0) }.filter { $0.kind != .audio }
         return visual.count == 1 ? visual[0] : nil
     }
 
+    /// Whether the selected target clip is actually visible and unlocked at the current playhead time.
+    private var activeTarget: Clip? {
+        guard let c = target else { return nil }
+        let t = Double(clock.frame) / max(1, model.project.fps)
+        guard t >= c.start - 1e-4 && t < c.end - 1e-4 else { return nil }
+        if let track = model.project.videoTracks.first(where: { $0.id == c.trackID }), track.hidden || track.locked { return nil }
+        return c
+    }
+
+    private func baseRect(for clip: Clip, in canvas: CGSize) -> CGRect {
+        if clip.kind == .solid { return CGRect(origin: .zero, size: canvas) }
+        if let aid = clip.assetID, let asset = model.project.asset(aid), asset.width > 0, asset.height > 0 {
+            return ClipTransform.fittedBaseRect(sourceSize: CGSize(width: asset.width, height: asset.height), canvasSize: canvas)
+        }
+        return CGRect(origin: .zero, size: canvas)
+    }
+
+    /// Hit-tests topmost visible unlocked visual clip at a point in viewer coordinates (`yUp: false`).
+    private func hitTestClip(at point: CGPoint, in canvas: CGSize) -> Clip? {
+        let t = Double(clock.frame) / max(1, model.project.fps)
+        for track in model.project.videoTracks.reversed() where !track.hidden && !track.locked {
+            let clips = model.project.clips.filter { $0.trackID == track.id && $0.kind != .audio && t >= $0.start && t < $0.end }
+            for c in clips {
+                if c.kind == .text {
+                    let cx = CGFloat(c.text.x) * canvas.width
+                    let cy = CGFloat(c.text.y) * canvas.height
+                    let hit = CGRect(x: cx - canvas.width * 0.35, y: cy - 40, width: canvas.width * 0.7, height: 80)
+                    if hit.contains(point) { return c }
+                } else if c.isTransformable {
+                    let tf = c.transform ?? ClipTransform()
+                    guard tf.opacity > 0.001 else { continue }
+                    let br = baseRect(for: c, in: canvas)
+                    let cr = tf.croppedRect(in: br, yUp: false)
+                    let inv = tf.affine(canvasSize: canvas, yUp: false).inverted()
+                    let localPt = point.applying(inv)
+                    if cr.insetBy(dx: -6, dy: -6).contains(localPt) { return c }
+                }
+            }
+        }
+        return nil
+    }
+
     private func setTransform(_ id: UUID, _ body: @escaping (inout ClipTransform) -> Void) {
-        model.live(autoCommit: false) { p in
+        model.liveVisual(autoCommit: false) { p in
             guard let i = p.index(of: id) else { return }
             var t = p.clips[i].transform ?? ClipTransform()
             body(&t)
+            t.clampAll()
             p.clips[i].transform = t.isIdentity ? nil : t
         }
     }
@@ -107,6 +182,13 @@ struct PreviewView: View {
             .padding(.horizontal, 16)
             .padding(.top, 16)
 
+            // CapCut-style quick canvas bar when a visual transformable clip is selected.
+            if let clip = activeTarget, clip.isTransformable, !model.viewerOnly {
+                CanvasQuickBar(clip: clip, model: model)
+                    .padding(.top, 6)
+                    .padding(.horizontal, 16)
+            }
+
             // The bar takes the whole space under the picture, so its controls sit in the middle of it.
             TransportBar(model: model, clock: model.clock, meters: model.meters, zoom: $zoom)
         }
@@ -114,62 +196,445 @@ struct PreviewView: View {
     }
 
     @ViewBuilder private func picture(w: CGFloat, h: CGFloat) -> some View {
-                let clip = target
-                ZStack(alignment: .topLeading) {
-                    PreviewSurfaceView(model: model)
-                        .frame(width: w, height: h)
-                        .clipShape(RoundedRectangle(cornerRadius: 3, style: .continuous))
-                        .overlay(RoundedRectangle(cornerRadius: 3, style: .continuous).strokeBorder(Theme.ink.opacity(0.06)))
-                    // Nothing on the timeline yet: say how to start, and take a click as "import". Not while
-                    // a Media item is hovered: its frame is drawn underneath, by the player, once skimming rests.
-                    if model.project.clips.isEmpty, source.current == nil {
-                        EmptyViewerPrompt(hasMedia: !model.project.assets.isEmpty) { model.showImportPanel() }
-                            .frame(width: w, height: h)
+        let canvasSize = CGSize(width: max(1, w), height: max(1, h))
+        let clip = activeTarget
+        ZStack(alignment: .topLeading) {
+            PreviewSurfaceView(model: model)
+                .frame(width: w, height: h)
+                .clipShape(RoundedRectangle(cornerRadius: 3, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: 3, style: .continuous).strokeBorder(Theme.ink.opacity(0.06)))
+
+            // Magnetic alignment guide lines (shown while moving/aligning on canvas).
+            if guides != SnapGuides() {
+                Canvas { ctx, size in
+                    let lineColor = Color(hex: 0x38BDF8).opacity(0.9)
+                    let style = StrokeStyle(lineWidth: 1, dash: [4, 3])
+                    if guides.centerX {
+                        var p = Path(); p.move(to: CGPoint(x: size.width / 2, y: 0)); p.addLine(to: CGPoint(x: size.width / 2, y: size.height))
+                        ctx.stroke(p, with: .color(lineColor), style: style)
                     }
-                    // A library item being hover-scrubbed shows here, labelled so it isn't mistaken for the edit.
-                    if let s = source.current {
-                        SourceFrame(current: s).frame(width: w, height: h)
+                    if guides.centerY {
+                        var p = Path(); p.move(to: CGPoint(x: 0, y: size.height / 2)); p.addLine(to: CGPoint(x: size.width, y: size.height / 2))
+                        ctx.stroke(p, with: .color(lineColor), style: style)
+                    }
+                    if guides.leftEdge {
+                        var p = Path(); p.move(to: CGPoint(x: 1, y: 0)); p.addLine(to: CGPoint(x: 1, y: size.height))
+                        ctx.stroke(p, with: .color(Color(hex: 0xF5C542)), lineWidth: 1.5)
+                    }
+                    if guides.rightEdge {
+                        var p = Path(); p.move(to: CGPoint(x: size.width - 1, y: 0)); p.addLine(to: CGPoint(x: size.width - 1, y: size.height))
+                        ctx.stroke(p, with: .color(Color(hex: 0xF5C542)), lineWidth: 1.5)
+                    }
+                    if guides.topEdge {
+                        var p = Path(); p.move(to: CGPoint(x: 0, y: 1)); p.addLine(to: CGPoint(x: size.width, y: 1))
+                        ctx.stroke(p, with: .color(Color(hex: 0xF5C542)), lineWidth: 1.5)
+                    }
+                    if guides.bottomEdge {
+                        var p = Path(); p.move(to: CGPoint(x: 0, y: size.height - 1)); p.addLine(to: CGPoint(x: size.width, y: size.height - 1))
+                        ctx.stroke(p, with: .color(Color(hex: 0xF5C542)), lineWidth: 1.5)
                     }
                 }
-                .frame(width: w, height: h, alignment: .topLeading)
-                .coordinateSpace(name: "viewer")
-                .contentShape(Rectangle())
-                .gesture(
-                    DragGesture(minimumDistance: 2, coordinateSpace: .named("viewer"))
-                        .onChanged { v in
-                            guard let c = target else { return }
-                            if c.kind == .text {
-                                if moveStart == nil { moveStart = (c.text.x, c.text.y) }
-                                guard let s = moveStart else { return }
-                                let nx = min(1, max(0, s.x + Double(v.translation.width / w)))
-                                let ny = min(1, max(0, s.y + Double(v.translation.height / h)))
-                                model.live(autoCommit: false) { p in
-                                    if let i = p.index(of: c.id) {
-                                        p.clips[i].text.x = nx
-                                        p.clips[i].text.y = ny
-                                    }
-                                }
-                            } else if c.isTransformable {
-                                let tf = c.transform ?? ClipTransform()
-                                if moveStart == nil { moveStart = (tf.x, tf.y) }
-                                guard let s = moveStart else { return }
-                                var nx = s.x + Double(v.translation.width / w)
-                                var ny = s.y + Double(v.translation.height / h)
-                                // Snap back to centre within a few points.
-                                if abs(nx) * Double(w) < 5 { nx = 0 }
-                                if abs(ny) * Double(h) < 5 { ny = 0 }
-                                let width = Double(model.project.width), height = Double(model.project.height)
-                                setTransform(c.id) {
-                                    $0.x = (nx * width).rounded() / width
-                                    $0.y = (ny * height).rounded() / height
-                                }
+                .frame(width: w, height: h)
+                .allowsHitTesting(false)
+            }
+
+            // CapCut-style direct-manipulation bounding box + 4 crop edges + 4 scale corners + rotation handle.
+            if let c = clip, c.isTransformable, !model.isPlaying, source.current == nil, !model.viewerOnly {
+                directManipulationOverlay(for: c, canvasSize: canvasSize)
+            }
+
+            // Live numeric HUD pill while dragging/scaling/cropping/rotating.
+            if let hud = hudText {
+                Text(hud)
+                    .font(Theme.mono(11, .semibold))
+                    .foregroundStyle(Color.white)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 5)
+                    .background(Capsule().fill(Color.black.opacity(0.78)))
+                    .overlay(Capsule().strokeBorder(Color(hex: 0x38BDF8).opacity(0.6), lineWidth: 1))
+                    .position(x: w / 2, y: 22)
+                    .allowsHitTesting(false)
+            }
+
+            // Nothing on the timeline yet: say how to start, and take a click as "import". Not while
+            // a Media item is hovered: its frame is drawn underneath, by the player, once skimming rests.
+            if model.project.clips.isEmpty, source.current == nil {
+                EmptyViewerPrompt(hasMedia: !model.project.assets.isEmpty) { model.showImportPanel() }
+                    .frame(width: w, height: h)
+            }
+            // A library item being hover-scrubbed shows here, labelled so it isn't mistaken for the edit.
+            if let s = source.current {
+                SourceFrame(current: s).frame(width: w, height: h)
+            }
+        }
+        .frame(width: w, height: h, alignment: .topLeading)
+        .coordinateSpace(name: "viewer")
+        .contentShape(Rectangle())
+        .onTapGesture { loc in
+            guard !model.project.clips.isEmpty, source.current == nil else { return }
+            if let hit = hitTestClip(at: loc, in: canvasSize) {
+                model.selection = [hit.id]
+            } else {
+                model.selection = []
+            }
+        }
+        .gesture(
+            DragGesture(minimumDistance: 2, coordinateSpace: .named("viewer"))
+                .onChanged { v in
+                    // Auto-select clip under drag start if nothing (or a different clip) is selected.
+                    if canvasDrag == nil, moveStart == nil, let hit = hitTestClip(at: v.startLocation, in: canvasSize) {
+                        if !model.selection.contains(hit.id) {
+                            model.selection = [hit.id]
+                        }
+                    }
+                    guard let c = activeTarget else { return }
+                    if c.kind == .text {
+                        if moveStart == nil { moveStart = (c.text.x, c.text.y) }
+                        guard let s = moveStart else { return }
+                        var nx = min(1, max(0, s.x + Double(v.translation.width / canvasSize.width)))
+                        var ny = min(1, max(0, s.y + Double(v.translation.height / canvasSize.height)))
+                        var g = SnapGuides()
+                        if abs((nx - 0.5) * Double(canvasSize.width)) < 6 { nx = 0.5; g.centerX = true }
+                        if abs((ny - 0.5) * Double(canvasSize.height)) < 6 { ny = 0.5; g.centerY = true }
+                        guides = g
+                        hudText = String(format: "Title %.0f%%, %.0f%%", nx * 100, ny * 100)
+                        model.liveVisual(autoCommit: false) { p in
+                            if let i = p.index(of: c.id) {
+                                p.clips[i].text.x = nx
+                                p.clips[i].text.y = ny
                             }
                         }
-                        .onEnded { _ in
-                            moveStart = nil
-                            model.commitLive()
-                        }
+                    } else if c.isTransformable {
+                        handleTransformDrag(clip: c, handle: .body, value: v, canvasSize: canvasSize)
+                    }
+                }
+                .onEnded { _ in
+                    endCanvasDrag()
+                }
+        )
+        .onChange(of: model.isPlaying) { _, playing in if playing { cancelCanvasDragIfActive() } }
+        .onChange(of: model.selection) { _, _ in cancelCanvasDragIfActive() }
+        .onChange(of: model.viewerOnly) { _, _ in cancelCanvasDragIfActive() }
+        .onDisappear { cancelCanvasDragIfActive() }
+    }
+
+    private func cancelCanvasDragIfActive() {
+        guard canvasDrag != nil || moveStart != nil || hudText != nil || guides != SnapGuides() else { return }
+        endCanvasDrag()
+    }
+
+    @ViewBuilder
+    private func directManipulationOverlay(for clip: Clip, canvasSize: CGSize) -> some View {
+        let tf = clip.transform ?? ClipTransform()
+        let br = baseRect(for: clip, in: canvasSize)
+        let cr = tf.croppedRect(in: br, yUp: false)
+        let m = tf.affine(canvasSize: canvasSize, yUp: false)
+
+        let tl = CGPoint(x: cr.minX, y: cr.minY).applying(m)
+        let tr = CGPoint(x: cr.maxX, y: cr.minY).applying(m)
+        let brPt = CGPoint(x: cr.maxX, y: cr.maxY).applying(m)
+        let bl = CGPoint(x: cr.minX, y: cr.maxY).applying(m)
+
+        let topMid = CGPoint(x: (tl.x + tr.x) / 2, y: (tl.y + tr.y) / 2)
+        let botMid = CGPoint(x: (bl.x + brPt.x) / 2, y: (bl.y + brPt.y) / 2)
+        let leftMid = CGPoint(x: (tl.x + bl.x) / 2, y: (tl.y + bl.y) / 2)
+        let rightMid = CGPoint(x: (tr.x + brPt.x) / 2, y: (tr.y + brPt.y) / 2)
+
+        // Unit normal pointing "up" from the top edge for the rotation lollipop handle.
+        // When the top edge is near the canvas top (e.g. default scale == 1), fold the handle inside
+        // so it never clips into window chrome or ScrollView bounds.
+        let topVec = CGPoint(x: tr.x - tl.x, y: tr.y - tl.y)
+        let topLen = max(1, hypot(topVec.x, topVec.y))
+        let upNormal = CGPoint(x: topVec.y / topLen, y: -topVec.x / topLen)
+        let rawRot = CGPoint(x: topMid.x + upNormal.x * 26, y: topMid.y + upNormal.y * 26)
+        let rotHandle: CGPoint = (rawRot.y < 14 || rawRot.x < 14 || rawRot.x > canvasSize.width - 14 || rawRot.y > canvasSize.height - 14)
+            ? CGPoint(x: min(max(16, topMid.x - upNormal.x * 22), canvasSize.width - 16),
+                      y: min(max(16, topMid.y - upNormal.y * 22), canvasSize.height - 16))
+            : rawRot
+        let isCropping: Bool = {
+            if let h = canvasDrag?.handle {
+                switch h { case .cropLeft, .cropRight, .cropTop, .cropBottom: return true; default: return false }
+            }
+            return false
+        }()
+
+        ZStack(alignment: .topLeading) {
+            // Outline of full uncropped source frame while cropping (or when cropped) + crisp cropped box.
+            Canvas { ctx, _ in
+                if tf.hasCrop || isCropping {
+                    let btl = CGPoint(x: br.minX, y: br.minY).applying(m)
+                    let btr = CGPoint(x: br.maxX, y: br.minY).applying(m)
+                    let bbr = CGPoint(x: br.maxX, y: br.maxY).applying(m)
+                    let bbl = CGPoint(x: br.minX, y: br.maxY).applying(m)
+                    var ghost = Path()
+                    ghost.move(to: btl); ghost.addLine(to: btr); ghost.addLine(to: bbr); ghost.addLine(to: bbl); ghost.closeSubpath()
+                    ctx.stroke(ghost, with: .color(Color.white.opacity(isCropping ? 0.45 : 0.2)),
+                               style: StrokeStyle(lineWidth: 1, dash: [4, 4]))
+                }
+                var box = Path()
+                box.move(to: tl); box.addLine(to: tr); box.addLine(to: brPt); box.addLine(to: bl); box.closeSubpath()
+                ctx.stroke(box, with: .color(Color(hex: 0x38BDF8)), lineWidth: 1.5)
+
+                var stem = Path()
+                stem.move(to: topMid); stem.addLine(to: rotHandle)
+                ctx.stroke(stem, with: .color(Color(hex: 0x38BDF8).opacity(0.9)), lineWidth: 1.2)
+            }
+            .frame(width: canvasSize.width, height: canvasSize.height)
+            .allowsHitTesting(false)
+
+            // 4 Edge Crop Handles (CapCut/Figma-style pills: drag inward/outward to crop directly!).
+            edgeHandle(clip: clip, handle: .cropTop, at: topMid, angleDeg: tf.rotation, horizontal: true, canvasSize: canvasSize)
+            edgeHandle(clip: clip, handle: .cropBottom, at: botMid, angleDeg: tf.rotation, horizontal: true, canvasSize: canvasSize)
+            edgeHandle(clip: clip, handle: .cropLeft, at: leftMid, angleDeg: tf.rotation, horizontal: false, canvasSize: canvasSize)
+            edgeHandle(clip: clip, handle: .cropRight, at: rightMid, angleDeg: tf.rotation, horizontal: false, canvasSize: canvasSize)
+
+            // 4 Corner Scale Handles.
+            cornerHandle(clip: clip, handle: .topLeft, at: tl, canvasSize: canvasSize)
+            cornerHandle(clip: clip, handle: .topRight, at: tr, canvasSize: canvasSize)
+            cornerHandle(clip: clip, handle: .bottomLeft, at: bl, canvasSize: canvasSize)
+            cornerHandle(clip: clip, handle: .bottomRight, at: brPt, canvasSize: canvasSize)
+
+            // Top Rotation Handle.
+            Circle()
+                .fill(Color.white)
+                .overlay(Circle().strokeBorder(Color(hex: 0x38BDF8), lineWidth: 1.5))
+                .overlay(Image(systemName: "arrow.triangle.2.circlepath").font(.system(size: 8.5, weight: .bold)).foregroundStyle(Color.black))
+                .frame(width: 18, height: 18)
+                .shadow(color: .black.opacity(0.45), radius: 2)
+                .frame(width: 28, height: 28)
+                .contentShape(Circle())
+                .position(rotHandle)
+                .onTapGesture {}
+                .gesture(
+                    DragGesture(minimumDistance: 1, coordinateSpace: .named("viewer"))
+                        .onChanged { v in handleTransformDrag(clip: clip, handle: .rotate, value: v, canvasSize: canvasSize) }
+                        .onEnded { _ in endCanvasDrag() }
                 )
+        }
+        .frame(width: canvasSize.width, height: canvasSize.height, alignment: .topLeading)
+    }
+
+    private func cornerHandle(clip: Clip, handle: CanvasHandle, at point: CGPoint, canvasSize: CGSize) -> some View {
+        Circle()
+            .fill(Color.white)
+            .overlay(Circle().strokeBorder(Color(hex: 0x38BDF8), lineWidth: 1.5))
+            .frame(width: 11, height: 11)
+            .shadow(color: .black.opacity(0.45), radius: 2)
+            .frame(width: 26, height: 26)
+            .contentShape(Rectangle())
+            .position(point)
+            .onTapGesture {}
+            .gesture(
+                DragGesture(minimumDistance: 1, coordinateSpace: .named("viewer"))
+                    .onChanged { v in handleTransformDrag(clip: clip, handle: handle, value: v, canvasSize: canvasSize) }
+                    .onEnded { _ in endCanvasDrag() }
+            )
+    }
+
+    private func edgeHandle(clip: Clip, handle: CanvasHandle, at point: CGPoint, angleDeg: Double, horizontal: Bool, canvasSize: CGSize) -> some View {
+        Capsule()
+            .fill(Color(hex: 0xF5C542))
+            .overlay(Capsule().strokeBorder(Color.black.opacity(0.7), lineWidth: 1))
+            .frame(width: horizontal ? 24 : 6, height: horizontal ? 6 : 24)
+            .rotationEffect(.degrees(angleDeg))
+            .shadow(color: .black.opacity(0.45), radius: 2)
+            .frame(width: 28, height: 28)
+            .contentShape(Rectangle())
+            .position(point)
+            .help("Drag edge to crop")
+            .onTapGesture {}
+            .gesture(
+                DragGesture(minimumDistance: 1, coordinateSpace: .named("viewer"))
+                    .onChanged { v in handleTransformDrag(clip: clip, handle: handle, value: v, canvasSize: canvasSize) }
+                    .onEnded { _ in endCanvasDrag() }
+            )
+    }
+
+    private func endCanvasDrag() {
+        canvasDrag = nil
+        moveStart = nil
+        guides = SnapGuides()
+        hudText = nil
+        model.commitLive()
+    }
+
+    private func handleTransformDrag(clip: Clip, handle: CanvasHandle, value: DragGesture.Value, canvasSize: CGSize) {
+        if canvasDrag == nil || canvasDrag?.clipID != clip.id || canvasDrag?.handle != handle {
+            let initial = clip.transform ?? ClipTransform()
+            let br = baseRect(for: clip, in: canvasSize)
+            let m = initial.affine(canvasSize: canvasSize, yUp: false)
+            let center = CGPoint(x: canvasSize.width / 2 + initial.x * canvasSize.width,
+                                 y: canvasSize.height / 2 + initial.y * canvasSize.height)
+            let startAng = atan2(Double(value.startLocation.y - center.y), Double(value.startLocation.x - center.x))
+            canvasDrag = CanvasDragState(clipID: clip.id, handle: handle, initial: initial,
+                                         baseRect: br, initialAffine: m, startPoint: value.startLocation, startAngle: startAng)
+        }
+        guard let st = canvasDrag else { return }
+        let w = Double(canvasSize.width), h = Double(canvasSize.height)
+        let projW = Double(model.project.width), projH = Double(model.project.height)
+
+        switch handle {
+        case .body:
+            var nx = st.initial.x + Double(value.translation.width) / w
+            var ny = st.initial.y + Double(value.translation.height) / h
+            var g = SnapGuides()
+            let snapPx = 6.0
+            if abs(nx * w) < snapPx { nx = 0; g.centerX = true }
+            if abs(ny * h) < snapPx { ny = 0; g.centerY = true }
+            // Edge snap when unrotated.
+            if abs(st.initial.rotation) < 0.1 {
+                var probe = st.initial; probe.x = nx; probe.y = ny
+                let cr = probe.croppedRect(in: st.baseRect, yUp: false)
+                let rect = cr.applying(probe.affine(canvasSize: canvasSize, yUp: false))
+                if abs(rect.minX) < snapPx { nx -= Double(rect.minX) / w; g.leftEdge = true }
+                else if abs(rect.maxX - canvasSize.width) < snapPx { nx -= Double(rect.maxX - canvasSize.width) / w; g.rightEdge = true }
+                if abs(rect.minY) < snapPx { ny -= Double(rect.minY) / h; g.topEdge = true }
+                else if abs(rect.maxY - canvasSize.height) < snapPx { ny -= Double(rect.maxY - canvasSize.height) / h; g.bottomEdge = true }
+            }
+            guides = g
+            let pxX = (nx * projW).rounded(), pxY = (ny * projH).rounded()
+            hudText = String(format: "Pos %.0f, %.0f", pxX, pxY)
+            setTransform(clip.id) {
+                $0.x = pxX / projW
+                $0.y = pxY / projH
+            }
+
+        case .topLeft, .topRight, .bottomLeft, .bottomRight:
+            let center = CGPoint(x: canvasSize.width / 2 + st.initial.x * canvasSize.width,
+                                 y: canvasSize.height / 2 + st.initial.y * canvasSize.height)
+            let d0 = max(10, hypot(st.startPoint.x - center.x, st.startPoint.y - center.y))
+            let d1 = max(5, hypot(value.location.x - center.x, value.location.y - center.y))
+            var ns = (st.initial.scale * Double(d1 / d0)).clamped(to: ClipTransform.scaleRange)
+            if abs(ns - 1.0) < 0.025 { ns = 1.0 }
+            ns = (ns * 1000).rounded() / 1000
+            guides = SnapGuides()
+            hudText = String(format: "Scale %.0f%%", ns * 100)
+            setTransform(clip.id) { $0.scale = ns }
+
+        case .rotate:
+            let center = CGPoint(x: canvasSize.width / 2 + st.initial.x * canvasSize.width,
+                                 y: canvasSize.height / 2 + st.initial.y * canvasSize.height)
+            let ang = atan2(Double(value.location.y - center.y), Double(value.location.x - center.x))
+            var deg = st.initial.rotation + (ang - st.startAngle) * 180.0 / .pi
+            while deg > 180 { deg -= 360 }
+            while deg < -180 { deg += 360 }
+            for snap in [-180.0, -135.0, -90.0, -45.0, 0.0, 45.0, 90.0, 135.0, 180.0] {
+                if abs(deg - snap) < 4.0 { deg = snap; break }
+            }
+            deg = (deg * 10).rounded() / 10
+            guides = SnapGuides()
+            hudText = String(format: "Rotate %.1f°", deg)
+            setTransform(clip.id) { $0.rotation = deg }
+
+        case .cropLeft, .cropRight, .cropTop, .cropBottom:
+            // Project drag into clip's un-transformed local space (works accurately even when rotated & scaled!).
+            let inv = st.initialAffine.inverted()
+            let p0 = st.startPoint.applying(inv)
+            let p1 = value.location.applying(inv)
+            let dx = Double(p1.x - p0.x) / max(1, Double(st.baseRect.width))
+            let dy = Double(p1.y - p0.y) / max(1, Double(st.baseRect.height))
+            var l = st.initial.cropLeft, r = st.initial.cropRight
+            var t = st.initial.cropTop, b = st.initial.cropBottom
+            switch handle {
+            case .cropLeft: l = (st.initial.cropLeft + dx).clamped(to: 0...(max(0, 0.95 - r)))
+            case .cropRight: r = (st.initial.cropRight - dx).clamped(to: 0...(max(0, 0.95 - l)))
+            case .cropTop: t = (st.initial.cropTop + dy).clamped(to: 0...(max(0, 0.95 - b)))
+            case .cropBottom: b = (st.initial.cropBottom - dy).clamped(to: 0...(max(0, 0.95 - t)))
+            default: break
+            }
+            l = (l * 1000).rounded() / 1000
+            r = (r * 1000).rounded() / 1000
+            t = (t * 1000).rounded() / 1000
+            b = (b * 1000).rounded() / 1000
+            guides = SnapGuides()
+            hudText = String(format: "Crop L:%.0f%% R:%.0f%% T:%.0f%% B:%.0f%%", l * 100, r * 100, t * 100, b * 100)
+            setTransform(clip.id) {
+                $0.cropLeft = l
+                $0.cropRight = r
+                $0.cropTop = t
+                $0.cropBottom = b
+            }
+        }
+    }
+}
+
+/// Compact CapCut-style quick action bar beneath the viewer when a visual clip is selected.
+private struct CanvasQuickBar: View {
+    let clip: Clip
+    @ObservedObject var model: EditorModel
+
+    private var tf: ClipTransform { clip.transform ?? ClipTransform() }
+
+    private func apply(_ body: @escaping (inout ClipTransform) -> Void) {
+        model.mutate { p in
+            guard let i = p.index(of: clip.id) else { return }
+            var t = p.clips[i].transform ?? ClipTransform()
+            body(&t)
+            t.clampAll()
+            p.clips[i].transform = t.isIdentity ? nil : t
+        }
+    }
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "crop")
+                .font(.system(size: 10.5, weight: .semibold))
+                .foregroundStyle(Color(hex: 0xF5C542))
+            Text("Drag edges to crop · corners to scale")
+                .font(.system(size: 11))
+                .foregroundStyle(Theme.textDim)
+            Spacer(minLength: 8)
+            quickBtn(symbol: "arrow.left.and.right.righttriangle.left.righttriangle.right", label: "Flip H", active: tf.flipH) {
+                apply { $0.flipH.toggle() }
+            }
+            quickBtn(symbol: "arrow.up.and.down.righttriangle.up.righttriangle.down", label: "Flip V", active: tf.flipV) {
+                apply { $0.flipV.toggle() }
+            }
+            quickBtn(symbol: "circle.dashed", label: tf.maskShape == .circle ? "Circle" : "Round", active: tf.hasMask) {
+                apply {
+                    if !$0.hasMask {
+                        $0.maskShape = .roundedRect
+                        $0.cornerRadius = 0.12
+                    } else if $0.maskShape == .roundedRect {
+                        $0.maskShape = .circle
+                    } else {
+                        $0.maskShape = .none
+                        $0.cornerRadius = 0
+                        $0.maskFeather = 0
+                    }
+                }
+            }
+            if tf.hasCrop {
+                quickBtn(symbol: "crop", label: "Reset Crop", active: false) {
+                    apply { $0.cropLeft = 0; $0.cropRight = 0; $0.cropTop = 0; $0.cropBottom = 0 }
+                }
+            }
+            if !tf.isIdentity {
+                quickBtn(symbol: "arrow.counterclockwise", label: "Reset", active: false) {
+                    model.mutate { p in
+                        if let i = p.index(of: clip.id) { p.clips[i].transform = nil }
+                    }
+                }
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 5)
+        .background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(Theme.field))
+        .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).strokeBorder(Theme.ink.opacity(0.08)))
+    }
+
+    private func quickBtn(symbol: String, label: String, active: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack(spacing: 4) {
+                Image(systemName: symbol).font(.system(size: 10, weight: .semibold))
+                Text(label).font(.system(size: 10.5, weight: .medium))
+            }
+            .foregroundStyle(active ? Color.black : Theme.textDim)
+            .padding(.horizontal, 7)
+            .frame(height: 22)
+            .background(RoundedRectangle(cornerRadius: 5, style: .continuous).fill(active ? Color(hex: 0xF5C542) : Theme.raised))
+        }
+        .buttonStyle(.plain)
     }
 }
 

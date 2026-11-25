@@ -325,7 +325,9 @@ enum GradeBaker {
             }
         }
         let out = data.withUnsafeBufferPointer { Data(buffer: $0) }
-        if cache.count > 200 { cache.removeAll() }
+        if cache.count > 200 {
+            for k in cache.keys.prefix(100) { cache.removeValue(forKey: k) }
+        }
         cache[grade] = out
         return out
     }

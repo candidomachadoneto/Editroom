@@ -18,7 +18,9 @@ enum MCPTools {
     get_project and list_media; analyze_media finds a clip's best moments or a song's beats; \
     look_at_media shows you a clip or photo, and get_frame shows you the cut; search_media finds shots by what they \
     show or what's said. After looking at a clip, save what you saw with note_media; list_media gives those notes \
-    back next time, so trust a clip's notes and look again only for an exact frame. Each edit is shown to the person with your own cursor and can be undone with history. \
+    back next time, so trust a clip's notes and look again only for an exact frame. Use set_transform to move, scale, \
+    rotate, flip or adjust opacity of any visual clip, set_crop to crop its four edges like an image, and set_mask to \
+    clip it into a rounded rectangle, ellipse or circle with optional feathering. Each edit is shown to the person with your own cursor and can be undone with history. \
     auto_edit builds a whole cut on its own, and export delivers it to a file (vertical, square or portrait too, at a \
     loudness target).
     """
@@ -580,11 +582,27 @@ enum MCPTools {
     // MARK: Performing
 
     /// Plays edits with the agent's cursor and waits until they're done; during a Magic edit, just
-    /// makes them in the draft.
+    /// makes them in the draft. When `MCPServer.shared.instantEdits` is on, external AI & voice edits
+    /// apply immediately (with <16ms GPU preview when paused) while each agent's cursor glides live
+    /// across the timeline in parallel — no 300ms serial animation lock.
     private static func perform(_ edits: [MagicEdit], _ model: EditorModel, _ who: String, _ draft: MCPDraft?) async throws {
         if let draft { return draft.apply(edits) }
         reveal(edits, model)
         let color = Self.color(for: who)
+        if MCPServer.shared.instantEdits, !edits.isEmpty {
+            model.mutate { p in
+                for e in edits { e.apply(&p, 1) }
+            }
+            if !model.isPlaying, isVisualOnly(edits) {
+                _ = model.engine.renderInstantFrame(project: model.project, media: model.media,
+                                                    at: model.playhead, scrubCache: model.media.scrubCache)
+            }
+            if let canvas = TimelineCanvas.current, let window = canvas.window, window.isVisible {
+                let target = instantCursorPoint(for: edits, project: model.project, canvas: canvas, window: window)
+                AgentPresence.shared.glide(who, name: who, color: color, to: target, in: window)
+            }
+            return
+        }
         let start = AgentPresence.shared.take(who)
         await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
             Task { @MainActor in
@@ -593,6 +611,35 @@ enum MCPTools {
                 })
             }
         }
+    }
+
+    /// True when every edit only mutates visual appearance (transform/crop/mask/grade/title/solid)
+    /// without altering clip timing, speed, source range, or track structure.
+    private static func isVisualOnly(_ edits: [MagicEdit]) -> Bool {
+        let visualLabels: Set<String> = ["Transform", "Crop", "Mask", "Title style", "Colour"]
+        return edits.allSatisfy { e in
+            switch e {
+            case .grade, .look, .type: return true
+            case .change(_, let label, _): return visualLabels.contains(label)
+            default: return false
+            }
+        }
+    }
+
+    /// Overlay coordinates (top-left origin) where an agent's cursor should glide for an instant edit.
+    private static func instantCursorPoint(for edits: [MagicEdit], project: Project,
+                                           canvas: TimelineCanvas, window: NSWindow) -> CGPoint {
+        func toOverlay(_ r: NSRect) -> CGPoint {
+            CGPoint(x: r.midX, y: window.frame.height - r.midY)
+        }
+        for e in edits.reversed() {
+            if let id = e.clipIDs.first, let clip = project.clip(id),
+               let r = canvas.magicWindowRect(of: clip, in: project) {
+                return toOverlay(r)
+            }
+        }
+        let tl = canvas.convert(canvas.bounds, to: nil)
+        return CGPoint(x: tl.midX, y: window.frame.height - tl.midY)
     }
 
     /// Scrolls the timeline so what's being edited is in view.
@@ -618,12 +665,21 @@ enum MCPTools {
         }
     }
 
-    /// Claude in its orange, OpenAI's agents in their green, anyone else in a colour of their own.
+    /// Brand colours for Claude, OpenAI, Gemini, Grok Bot & Voice Swarm workers, plus deterministic hues.
     static func color(for name: String) -> NSColor {
+        let lower = name.lowercased()
         switch name {
         case "Claude": return NSColor(srgbRed: 0.85, green: 0.47, blue: 0.34, alpha: 1)
         case "Codex", "ChatGPT": return NSColor(srgbRed: 0.06, green: 0.64, blue: 0.50, alpha: 1)
+        case "Gemini": return NSColor(srgbRed: 0.26, green: 0.52, blue: 0.96, alpha: 1)
+        case "Grok", "Grok-Diretor": return NSColor(srgbRed: 0.13, green: 0.83, blue: 0.93, alpha: 1)
+        case "Grok-Cortador": return NSColor(srgbRed: 0.96, green: 0.62, blue: 0.04, alpha: 1)
+        case "Grok-Prints": return NSColor(srgbRed: 0.22, green: 0.74, blue: 0.97, alpha: 1)
+        case "Grok-Titulos": return NSColor(srgbRed: 0.96, green: 0.25, blue: 0.37, alpha: 1)
+        case "Grok-Audio": return NSColor(srgbRed: 0.06, green: 0.73, blue: 0.51, alpha: 1)
+        case "Grok-Colorista": return NSColor(srgbRed: 0.98, green: 0.57, blue: 0.24, alpha: 1)
         default:
+            if lower.hasPrefix("gemini") { return NSColor(srgbRed: 0.26, green: 0.52, blue: 0.96, alpha: 1) }
             var h: UInt64 = 1469598103934665603
             for b in name.utf8 { h = (h ^ UInt64(b)) &* 1099511628211 }
             return NSColor(hue: CGFloat(h % 360) / 360, saturation: 0.65, brightness: 0.95, alpha: 1)
@@ -755,7 +811,25 @@ enum MCPTools {
                           "color": hex(c.text.color), "x": round3(c.text.x), "y": round3(c.text.y)]
         }
         if c.kind == .solid { d["color"] = hex(c.color) }
-        if let tf = c.transform, !tf.isIdentity { d["transform"] = ["scale": round3(tf.scale), "x": round3(tf.x), "y": round3(tf.y)] }
+        if let tf = c.transform, !tf.isIdentity {
+            var td: [String: Any] = ["scale": round3(tf.scale), "x": round3(tf.x), "y": round3(tf.y)]
+            if abs(tf.rotation) > 1e-4 { td["rotation"] = round3(tf.rotation) }
+            if abs(tf.opacity - 1) > 1e-4 { td["opacity"] = round3(tf.opacity) }
+            if tf.flipH { td["flip_h"] = true }
+            if tf.flipV { td["flip_v"] = true }
+            if tf.hasCrop {
+                td["crop_left"] = round3(tf.cropLeft)
+                td["crop_right"] = round3(tf.cropRight)
+                td["crop_top"] = round3(tf.cropTop)
+                td["crop_bottom"] = round3(tf.cropBottom)
+            }
+            if tf.hasMask {
+                td["mask_shape"] = tf.maskShape.rawValue
+                if tf.maskShape == .roundedRect { td["corner_radius"] = round3(tf.cornerRadius) }
+                if tf.maskFeather > 1e-4 { td["mask_feather"] = round3(tf.maskFeather) }
+            }
+            d["transform"] = td
+        }
         if let g = c.grade {
             var gd: [String: Any] = [:]
             if let look = g.look { gd["look"] = g.lookLabel; if look != g.lookLabel { gd["look_file"] = look } }
@@ -838,10 +912,37 @@ extension MCPTools {
             tool("delete_markers", "Delete markers", "Removes markers.", ["marker_ids": ["type": "array", "items": ["type": "string"]], "all": ["type": "boolean", "description": "Remove every marker."]]),
             tool("set_in_out", "Set in and out", "The in/out range: what Loop plays and what export can be limited to (range_only).",
                  ["in": num("Timeline seconds."), "out": num("Timeline seconds."), "clear": ["type": "boolean", "description": "Remove the range."]]),
-            tool("set_transform", "Position and scale", "Moves and scales a video, photo or solid in the frame, for reframing (keeping a subject in a vertical crop, a picture-in-picture). A title's place is set with set_title_style.",
+            tool("set_transform", "Position, scale, rotate & crop", "Moves, scales, rotates, flips, adjusts opacity, or crops/masks a video, photo or solid in the frame, treating it like an image layer. A title's place is set with set_title_style.",
                  ["clip_id": str("A clip's id."), "scale": num("1 fits the frame; 2 is twice as big (0.05...10)."),
                   "x": num("Offset of its centre across, as a fraction of the frame's width (0 is centred, 0.5 is the right edge)."),
-                  "y": num("Offset down, as a fraction of the frame's height (0 is centred, positive is lower)."), "reset": ["type": "boolean", "description": "Back to fitted and centred."]],
+                  "y": num("Offset down, as a fraction of the frame's height (0 is centred, positive is lower)."),
+                  "rotation": num("Clockwise rotation in degrees (-360...360)."),
+                  "opacity": num("Clip opacity, 0 (transparent) to 1 (opaque)."),
+                  "flip_h": ["type": "boolean", "description": "Mirror horizontally."],
+                  "flip_v": ["type": "boolean", "description": "Mirror vertically."],
+                  "crop_left": num("Normalized inset from left edge (0...0.95)."),
+                  "crop_right": num("Normalized inset from right edge (0...0.95)."),
+                  "crop_top": num("Normalized inset from top edge (0...0.95)."),
+                  "crop_bottom": num("Normalized inset from bottom edge (0...0.95)."),
+                  "mask_shape": ["type": "string", "enum": MaskShape.allCases.map(\.rawValue), "description": "Clip mask shape: none, roundedRect, ellipse, circle."],
+                  "corner_radius": num("Normalized corner radius for roundedRect mask (0...0.5)."),
+                  "mask_feather": num("Soft edge feather for mask (0...0.25)."),
+                  "reset": ["type": "boolean", "description": "Reset transform, crop and mask back to defaults."]],
+                 required: ["clip_id"]),
+            tool("set_crop", "Crop clip", "Crops a video, photo or solid clip from its four edges (0 = no crop, 0.25 = trim 25% off that side; remaining width and height stay >= 5%).",
+                 ["clip_id": str("A clip's id."),
+                  "left": num("Normalized inset from left edge (0...0.95)."),
+                  "right": num("Normalized inset from right edge (0...0.95)."),
+                  "top": num("Normalized inset from top edge (0...0.95)."),
+                  "bottom": num("Normalized inset from bottom edge (0...0.95)."),
+                  "reset": ["type": "boolean", "description": "Clear all 4 crop edges back to 0."]],
+                 required: ["clip_id"]),
+            tool("set_mask", "Mask clip", "Clips a video, photo or solid into a geometric shape (rounded rectangle, ellipse or circle) with optional soft feathering.",
+                 ["clip_id": str("A clip's id."),
+                  "shape": ["type": "string", "enum": MaskShape.allCases.map(\.rawValue), "description": "none, roundedRect, ellipse, or circle."],
+                  "corner_radius": num("Normalized corner radius for roundedRect (0...0.5, default 0.12)."),
+                  "feather": num("Normalized soft edge feather (0...0.25, default 0)."),
+                  "reset": ["type": "boolean", "description": "Remove the mask."]],
                  required: ["clip_id"]),
             tool("set_title_style", "Title style", "A title's words and look. Leave out what shouldn't change.",
                  ["clip_id": str("A title clip's id."), "text": str("The words."), "font": str("A font family installed on this Mac, or \"System\"."),
@@ -1058,12 +1159,116 @@ extension MCPTools {
         case "set_transform":
             let c = try clipArg(args, p)
             guard c.isTransformable else { throw MCPToolError(c.kind == .text ? "Titles are placed with set_title_style." : "Sound has no picture to move.") }
-            var tf = args["reset"] as? Bool == true ? ClipTransform() : (c.transform ?? ClipTransform())
-            if let s = double(args["scale"]) { tf.scale = s.clamped(to: ClipTransform.scaleRange) }
-            if let x = double(args["x"]) { tf.x = x.clamped(to: -2...2) }
-            if let y = double(args["y"]) { tf.y = y.clamped(to: -2...2) }
-            let set = tf
-            try await perform([.change(c.id, "Transform") { q in if let i = q.index(of: c.id) { q.clips[i].transform = set.isIdentity ? nil : set } }], model, who, draft)
+            let reset = args["reset"] as? Bool == true
+            let scale = double(args["scale"])
+            let x = double(args["x"])
+            let y = double(args["y"])
+            let rotation = double(args["rotation"])
+            let opacity = double(args["opacity"])
+            let flipH = args["flip_h"] as? Bool
+            let flipV = args["flip_v"] as? Bool
+            let cropL = double(args["crop_left"])
+            let cropR = double(args["crop_right"])
+            let cropT = double(args["crop_top"])
+            let cropB = double(args["crop_bottom"])
+            let maskShape = try (args["mask_shape"] as? String).map { raw -> MaskShape in
+                guard let m = MaskShape(rawValue: raw) else { throw MCPToolError("mask_shape is none, roundedRect, ellipse or circle.") }
+                return m
+            }
+            let cornerRadius = double(args["corner_radius"])
+            let maskFeather = double(args["mask_feather"])
+            try await perform([.change(c.id, "Transform") { q in
+                guard let i = q.index(of: c.id) else { return }
+                var tf = reset ? ClipTransform() : (q.clips[i].transform ?? ClipTransform())
+                if let scale { tf.scale = scale }
+                if let x { tf.x = x }
+                if let y { tf.y = y }
+                if let rotation { tf.rotation = rotation }
+                if let opacity { tf.opacity = opacity }
+                if let flipH { tf.flipH = flipH }
+                if let flipV { tf.flipV = flipV }
+                if let cropL { tf.cropLeft = cropL }
+                if let cropR { tf.cropRight = cropR }
+                if let cropT { tf.cropTop = cropT }
+                if let cropB { tf.cropBottom = cropB }
+                if let maskShape {
+                    tf.maskShape = maskShape
+                    if maskShape == .none {
+                        tf.cornerRadius = 0
+                        tf.maskFeather = 0
+                    } else if maskShape == .roundedRect, tf.cornerRadius <= 0, cornerRadius == nil {
+                        tf.cornerRadius = 0.12
+                    }
+                }
+                if let cornerRadius {
+                    tf.cornerRadius = cornerRadius
+                    if cornerRadius > 0, tf.maskShape == .none, maskShape == nil { tf.maskShape = .roundedRect }
+                }
+                if let maskFeather { tf.maskFeather = maskFeather }
+                tf.clampAll()
+                q.clips[i].transform = tf.isIdentity ? nil : tf
+            }], model, who, draft)
+            return json(clipsJSON([c.id], now()))
+
+        case "set_crop":
+            let c = try clipArg(args, p)
+            guard c.isTransformable else { throw MCPToolError("Only video, photo and solid clips can be cropped.") }
+            let reset = args["reset"] as? Bool == true
+            let left = double(args["left"])
+            let right = double(args["right"])
+            let top = double(args["top"])
+            let bottom = double(args["bottom"])
+            guard reset || left != nil || right != nil || top != nil || bottom != nil else {
+                throw MCPToolError("Give at least one of left, right, top, bottom (0...0.95), or reset: true.")
+            }
+            try await perform([.change(c.id, "Crop") { q in
+                guard let i = q.index(of: c.id) else { return }
+                var tf = q.clips[i].transform ?? ClipTransform()
+                if reset {
+                    tf.cropLeft = 0; tf.cropRight = 0; tf.cropTop = 0; tf.cropBottom = 0
+                } else {
+                    if let left { tf.cropLeft = left }
+                    if let right { tf.cropRight = right }
+                    if let top { tf.cropTop = top }
+                    if let bottom { tf.cropBottom = bottom }
+                }
+                tf.clampAll()
+                q.clips[i].transform = tf.isIdentity ? nil : tf
+            }], model, who, draft)
+            return json(clipsJSON([c.id], now()))
+
+        case "set_mask":
+            let c = try clipArg(args, p)
+            guard c.isTransformable else { throw MCPToolError("Only video, photo and solid clips can be masked.") }
+            let reset = args["reset"] as? Bool == true
+            let shape = try (args["shape"] as? String).map { raw -> MaskShape in
+                guard let m = MaskShape(rawValue: raw) else { throw MCPToolError("shape is none, roundedRect, ellipse or circle.") }
+                return m
+            }
+            let radius = double(args["corner_radius"])
+            let feather = double(args["feather"])
+            guard reset || shape != nil || radius != nil || feather != nil else {
+                throw MCPToolError("Give shape (none, roundedRect, ellipse, circle), corner_radius, feather, or reset: true.")
+            }
+            try await perform([.change(c.id, "Mask") { q in
+                guard let i = q.index(of: c.id) else { return }
+                var tf = q.clips[i].transform ?? ClipTransform()
+                if reset || shape == .none {
+                    tf.maskShape = .none; tf.cornerRadius = 0; tf.maskFeather = 0
+                } else {
+                    if let shape {
+                        tf.maskShape = shape
+                        if shape == .roundedRect, tf.cornerRadius <= 0, radius == nil { tf.cornerRadius = 0.12 }
+                    }
+                    if let radius {
+                        tf.cornerRadius = radius
+                        if radius > 0, tf.maskShape == .none { tf.maskShape = .roundedRect }
+                    }
+                    if let feather { tf.maskFeather = feather }
+                }
+                tf.clampAll()
+                q.clips[i].transform = tf.isIdentity ? nil : tf
+            }], model, who, draft)
             return json(clipsJSON([c.id], now()))
 
         case "set_title_style":

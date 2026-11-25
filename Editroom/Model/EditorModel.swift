@@ -757,25 +757,69 @@ final class EditorModel: ObservableObject {
         }
     }
 
+    /// Instant (<16ms) visual-only live change (transform, crop, mask, rotation, opacity, grade,
+    /// solid color, title placement). While paused, re-composites directly on the Metal GPU from
+    /// cached decoded frames without rebuilding AVMutableComposition or seeking AVPlayer; falls back
+    /// to normal rebuild when playing or if source frames aren't cached yet.
+    func liveVisual(autoCommit: Bool = false, _ body: (inout Project) -> Void) {
+        var p = project
+        body(&p)
+        guard p != project else { return }
+        if liveSnapshot == nil { liveSnapshot = project }
+        project = p
+        isDirty = true
+        if !isPlaying, !rebuildSuspended,
+           engine.renderInstantFrame(project: project, media: media, at: playhead, scrubCache: media.scrubCache) {
+            // GPU instant frame queued for next vsync; full player sync happens on commitLive().
+            instantVisualDirty = true
+        } else {
+            setNeedsRebuild()
+        }
+        liveTimer?.invalidate()
+        liveTimer = nil
+        if autoCommit {
+            liveTimer = Timer.scheduledTimer(withTimeInterval: 0.8, repeats: false) { [weak self] _ in
+                MainActor.assumeIsolated { self?.commitLive() }
+            }
+        }
+    }
+
+    private var instantVisualDirty = false
+
     /// Throws away a live change that hasn't been committed: back to how it was, with no undo step.
     func discardLive() {
         liveTimer?.invalidate()
         liveTimer = nil
+        instantVisualDirty = false
         guard let snapshot = liveSnapshot else { return }
         liveSnapshot = nil
         project = snapshot
+        engine.endScrubFrames()
         setNeedsRebuild()
     }
 
     func commitLive() {
         liveTimer?.invalidate()
         liveTimer = nil
-        guard let snapshot = liveSnapshot else { return }
+        let needsSync = instantVisualDirty
+        instantVisualDirty = false
+        guard let snapshot = liveSnapshot else {
+            if needsSync { engine.endScrubFrames(); setNeedsRebuild() }
+            return
+        }
         liveSnapshot = nil
         if snapshot != project {
+            var p = project
+            p.sanitize()
+            if p != project { project = p }
             undoStack.append(snapshot)
+            if undoStack.count > 200 { undoStack.removeFirst() }
             redoStack.removeAll()
-        redoKnown.removeAll()
+            redoKnown.removeAll()
+        }
+        if needsSync {
+            engine.endScrubFrames()
+            setNeedsRebuild()
         }
     }
 
@@ -835,14 +879,32 @@ final class EditorModel: ObservableObject {
     }
 
     /// Set while the magic show is building a cut, so the player isn't rebuilt every frame.
-    var rebuildSuspended = false {
-        didSet { if !rebuildSuspended { setNeedsRebuild() } }
+    /// Reference-counted internally so nested or cancelled shows never leave rebuilds stuck off.
+    private var suspendRebuildCount = 0
+    var rebuildSuspended: Bool {
+        get { suspendRebuildCount > 0 }
+        set {
+            if newValue {
+                suspendRebuildCount += 1
+            } else if suspendRebuildCount > 0 {
+                suspendRebuildCount -= 1
+                if suspendRebuildCount == 0 { setNeedsRebuild() }
+            }
+        }
+    }
+
+    /// Flushes any uncommitted liveVisual edits before playback, seeking, scrubbing, or skimming.
+    private func flushInstantVisual() {
+        if instantVisualDirty {
+            commitLive()
+            rebuildNow()
+        }
     }
 
     func setNeedsRebuild() {
         guard !rebuildPending, !rebuildSuspended else { return }
         rebuildPending = true
-        let wait = max(0, 0.03 - (CACurrentMediaTime() - lastRebuild))
+        let wait = max(0, 0.008 - (CACurrentMediaTime() - lastRebuild))
         DispatchQueue.main.asyncAfter(deadline: .now() + wait) { [weak self] in
             MainActor.assumeIsolated { self?.rebuildNow() }
         }
@@ -992,6 +1054,7 @@ final class EditorModel: ObservableObject {
 
     /// Shows the frame at a time without moving the playhead; nil goes back to the playhead's frame.
     func skim(to t: Double?) {
+        flushInstantVisual()
         guard let t else {
             if skimTime != nil {
                 skimTime = nil
@@ -1015,6 +1078,7 @@ final class EditorModel: ObservableObject {
     static let playFromSkimmerKey = "playFromSkimmer"
 
     func play() {
+        flushInstantVisual()
         if let s = skimTime {
             if UserDefaults.standard.object(forKey: Self.playFromSkimmerKey) as? Bool ?? true {
                 playhead = s
@@ -1050,6 +1114,7 @@ final class EditorModel: ObservableObject {
     }
 
     func seek(to time: Double) {
+        flushInstantVisual()
         skimTime = nil
         settleWork?.cancel()
         engine.endScrubFrames()
@@ -1064,6 +1129,7 @@ final class EditorModel: ObservableObject {
     /// Moving the playhead by dragging it: the viewer keeps up with the nearest frame it can show at
     /// once, and the exact frame follows when the drag rests for a moment or stops.
     func scrub(to time: Double) {
+        flushInstantVisual()
         skimTime = nil
         if isPlaying {
             engine.pause()

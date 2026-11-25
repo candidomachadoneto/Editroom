@@ -207,7 +207,21 @@ struct ReverseSource: Codable, Hashable {
     var sourceStart: Double
 }
 
-/// Scale and position of a clip within the frame.
+/// Shape mask applied inside a clip's cropped bounds.
+enum MaskShape: String, Codable, CaseIterable, Hashable {
+    case none, roundedRect, ellipse, circle
+
+    var label: String {
+        switch self {
+        case .none: return "None"
+        case .roundedRect: return "Rounded"
+        case .ellipse: return "Ellipse"
+        case .circle: return "Circle"
+        }
+    }
+}
+
+/// Scale, position, rotation, opacity, flip, 4-side crop and mask of a clip within the frame.
 struct ClipTransform: Codable, Hashable {
     /// 1 is fitted to the frame.
     var scale = 1.0
@@ -215,9 +229,139 @@ struct ClipTransform: Codable, Hashable {
     /// height. Positive y is down.
     var x = 0.0
     var y = 0.0
+    /// Clockwise rotation in degrees (-360...360).
+    var rotation = 0.0
+    /// Clip opacity (0...1), multiplied with fades/transitions.
+    var opacity = 1.0
+    /// Horizontal and vertical mirror flips.
+    var flipH = false
+    var flipV = false
+    /// Normalized 4-side crop insets (0...0.95) on the aspect-fitted clip rect.
+    var cropLeft = 0.0
+    var cropRight = 0.0
+    var cropTop = 0.0
+    var cropBottom = 0.0
+    /// Optional mask shape applied inside the cropped rectangle.
+    var maskShape: MaskShape = .none
+    /// Corner radius as a fraction of the shorter cropped edge (0...0.5).
+    var cornerRadius = 0.0
+    /// Soft mask feather as a fraction of the shorter cropped edge (0...0.25).
+    var maskFeather = 0.0
 
     var isIdentity: Bool { self == ClipTransform() }
+    var hasCrop: Bool { cropLeft > 1e-5 || cropRight > 1e-5 || cropTop > 1e-5 || cropBottom > 1e-5 }
+    var hasMask: Bool { maskShape != .none || cornerRadius > 1e-5 || maskFeather > 1e-5 }
+
     static let scaleRange = 0.05...10.0
+    static let rotationRange = -360.0...360.0
+    static let opacityRange = 0.0...1.0
+    static let cropRange = 0.0...0.95
+    static let radiusRange = 0.0...0.5
+    static let featherRange = 0.0...0.25
+
+    init(scale: Double = 1.0, x: Double = 0.0, y: Double = 0.0, rotation: Double = 0.0,
+         opacity: Double = 1.0, flipH: Bool = false, flipV: Bool = false,
+         cropLeft: Double = 0.0, cropRight: Double = 0.0, cropTop: Double = 0.0, cropBottom: Double = 0.0,
+         maskShape: MaskShape = .none, cornerRadius: Double = 0.0, maskFeather: Double = 0.0) {
+        self.scale = scale
+        self.x = x
+        self.y = y
+        self.rotation = rotation
+        self.opacity = opacity
+        self.flipH = flipH
+        self.flipV = flipV
+        self.cropLeft = cropLeft
+        self.cropRight = cropRight
+        self.cropTop = cropTop
+        self.cropBottom = cropBottom
+        self.maskShape = maskShape
+        self.cornerRadius = cornerRadius
+        self.maskFeather = maskFeather
+    }
+
+    /// Backward-compatible decoding so existing .room projects with only {scale, x, y} open identically.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        scale = try c.decodeIfPresent(Double.self, forKey: .scale) ?? 1.0
+        x = try c.decodeIfPresent(Double.self, forKey: .x) ?? 0.0
+        y = try c.decodeIfPresent(Double.self, forKey: .y) ?? 0.0
+        rotation = try c.decodeIfPresent(Double.self, forKey: .rotation) ?? 0.0
+        opacity = try c.decodeIfPresent(Double.self, forKey: .opacity) ?? 1.0
+        flipH = try c.decodeIfPresent(Bool.self, forKey: .flipH) ?? false
+        flipV = try c.decodeIfPresent(Bool.self, forKey: .flipV) ?? false
+        cropLeft = try c.decodeIfPresent(Double.self, forKey: .cropLeft) ?? 0.0
+        cropRight = try c.decodeIfPresent(Double.self, forKey: .cropRight) ?? 0.0
+        cropTop = try c.decodeIfPresent(Double.self, forKey: .cropTop) ?? 0.0
+        cropBottom = try c.decodeIfPresent(Double.self, forKey: .cropBottom) ?? 0.0
+        maskShape = try c.decodeIfPresent(MaskShape.self, forKey: .maskShape) ?? .none
+        cornerRadius = try c.decodeIfPresent(Double.self, forKey: .cornerRadius) ?? 0.0
+        maskFeather = try c.decodeIfPresent(Double.self, forKey: .maskFeather) ?? 0.0
+        clampAll()
+    }
+
+    mutating func clampAll() {
+        scale = scale.clamped(to: Self.scaleRange)
+        x = x.clamped(to: -4...4)
+        y = y.clamped(to: -4...4)
+        rotation = rotation.clamped(to: Self.rotationRange)
+        opacity = opacity.clamped(to: Self.opacityRange)
+        cropLeft = cropLeft.clamped(to: Self.cropRange)
+        cropRight = cropRight.clamped(to: Self.cropRange)
+        cropTop = cropTop.clamped(to: Self.cropRange)
+        cropBottom = cropBottom.clamped(to: Self.cropRange)
+        if cropLeft + cropRight > 0.95 {
+            let excess = (cropLeft + cropRight) - 0.95
+            cropRight = max(0, cropRight - excess)
+            if cropLeft + cropRight > 0.95 { cropLeft = max(0, 0.95 - cropRight) }
+        }
+        if cropTop + cropBottom > 0.95 {
+            let excess = (cropTop + cropBottom) - 0.95
+            cropBottom = max(0, cropBottom - excess)
+            if cropTop + cropBottom > 0.95 { cropTop = max(0, 0.95 - cropBottom) }
+        }
+        cornerRadius = cornerRadius.clamped(to: Self.radiusRange)
+        maskFeather = maskFeather.clamped(to: Self.featherRange)
+    }
+
+    /// Aspect-fitted base rectangle of a source frame centered inside `canvasSize`.
+    static func fittedBaseRect(sourceSize: CGSize, canvasSize: CGSize) -> CGRect {
+        guard sourceSize.width > 0, sourceSize.height > 0, canvasSize.width > 0, canvasSize.height > 0 else {
+            return CGRect(origin: .zero, size: canvasSize)
+        }
+        let s = min(canvasSize.width / sourceSize.width, canvasSize.height / sourceSize.height)
+        let w = sourceSize.width * s
+        let h = sourceSize.height * s
+        return CGRect(x: (canvasSize.width - w) / 2, y: (canvasSize.height - h) / 2, width: w, height: h)
+    }
+
+    /// Cropped rectangle inside `base`. Set `yUp = true` for Core Image (bottom-left origin),
+    /// or `yUp = false` for SwiftUI / AppKit viewer overlay (top-left origin).
+    func croppedRect(in base: CGRect, yUp: Bool) -> CGRect {
+        let l = cropLeft.clamped(to: Self.cropRange)
+        let r = min(cropRight.clamped(to: Self.cropRange), max(0, 0.95 - l))
+        let t = cropTop.clamped(to: Self.cropRange)
+        let b = min(cropBottom.clamped(to: Self.cropRange), max(0, 0.95 - t))
+        let x0 = base.minX + base.width * l
+        let w = max(1, base.width * (1 - l - r))
+        let h = max(1, base.height * (1 - t - b))
+        let y0 = yUp ? (base.minY + base.height * b) : (base.minY + base.height * t)
+        return CGRect(x: x0, y: y0, width: w, height: h)
+    }
+
+    /// Single shared affine transform from pre-transform canvas space to screen/compositor space.
+    /// `yUp = true` for Core Image (bottom-left origin, clockwise rotation = negative radians);
+    /// `yUp = false` for SwiftUI viewer space (top-left origin, clockwise rotation = positive radians).
+    func affine(canvasSize: CGSize, yUp: Bool) -> CGAffineTransform {
+        let cx = canvasSize.width / 2
+        let cy = canvasSize.height / 2
+        let rad = rotation * .pi / 180.0
+        let angle = yUp ? -rad : rad
+        let dy = yUp ? -y * canvasSize.height : y * canvasSize.height
+        return CGAffineTransform(translationX: -cx, y: -cy)
+            .concatenating(CGAffineTransform(scaleX: scale, y: scale))
+            .concatenating(CGAffineTransform(rotationAngle: angle))
+            .concatenating(CGAffineTransform(translationX: cx + x * canvasSize.width, y: cy + dy))
+    }
 }
 
 enum MediaKind: String, Codable { case video, audio, image }

@@ -10,16 +10,31 @@ final class MagicAgent: ObservableObject {
     static let shared = MagicAgent()
 
     enum Kind: String, CaseIterable, Identifiable {
-        case claude, chatgpt
+        case claude, chatgpt, gemini, grok
         var id: String { rawValue }
-        var name: String { self == .claude ? "Claude" : "ChatGPT" }
+        var name: String {
+            switch self {
+            case .claude: "Claude"
+            case .chatgpt: "ChatGPT"
+            case .gemini: "Gemini"
+            case .grok: "Grok"
+            }
+        }
     }
 
     /// The Magic popover's tabs: an AI, or the built-in cut on this Mac.
     enum Tab: String, CaseIterable, Identifiable {
-        case claude, chatgpt, local
+        case claude, chatgpt, gemini, grok, local
         var id: String { rawValue }
-        var kind: Kind? { self == .claude ? .claude : self == .chatgpt ? .chatgpt : nil }
+        var kind: Kind? {
+            switch self {
+            case .claude: .claude
+            case .chatgpt: .chatgpt
+            case .gemini: .gemini
+            case .grok: .grok
+            case .local: nil
+            }
+        }
         var name: String { kind?.name ?? "Local" }
     }
 
@@ -78,12 +93,19 @@ final class MagicAgent: ObservableObject {
         switch kind {
         case .claude: return c.states[.claude] == .connected || c.states[.claudeCode] == .connected
         case .chatgpt: return c.states[.chatgpt] == .connected
+        case .gemini: return c.states[.gemini] == .connected
+        case .grok: return c.states[.grokBot] == .connected
         }
     }
 
-    /// The program Magic runs is on this Mac: Claude Code, or the Codex that comes with ChatGPT.
+    /// The program Magic runs is on this Mac: Claude Code, Codex, Gemini CLI or Grok CLI.
     func runnable(_ kind: Kind) -> Bool {
-        kind == .claude ? AgentConnect.shared.claudeCLI != nil : AgentConnect.shared.codexCLI != nil
+        switch kind {
+        case .claude: return AgentConnect.shared.claudeCLI != nil
+        case .chatgpt: return AgentConnect.shared.codexCLI != nil
+        case .gemini: return AgentConnect.shared.geminiCLI != nil
+        case .grok: return AgentConnect.shared.grokCLI != nil
+        }
     }
 
     /// The app (or its program) is on this Mac at all.
@@ -91,6 +113,8 @@ final class MagicAgent: ObservableObject {
         switch kind {
         case .claude: return AgentConnect.appURL(AgentConnect.claudeBundleID) != nil || AgentConnect.shared.claudeCLI != nil
         case .chatgpt: return AgentConnect.chatgptBundleIDs.contains { AgentConnect.appURL($0) != nil } || AgentConnect.shared.codexCLI != nil
+        case .gemini: return AgentConnect.shared.geminiCLI != nil || FileManager.default.fileExists(atPath: AgentConnect.shared.geminiHome.path)
+        case .grok: return AgentConnect.appURL(AgentConnect.grokBundleID) != nil || AgentConnect.shared.grokCLI != nil || FileManager.default.fileExists(atPath: AgentConnect.shared.grokHome.path)
         }
     }
 
@@ -148,6 +172,17 @@ final class MagicAgent: ObservableObject {
                 return ModelOption(id: slug, name: name, efforts: efforts ?? ["low", "medium", "high", "xhigh"],
                                    defaultEffort: m?["default_reasoning_level"] as? String ?? "medium")
             }
+        case .gemini:
+            return [
+                ModelOption(id: "gemini-2.5-pro", name: "Gemini 2.5 Pro", blurb: "Best edits", efforts: [], defaultEffort: ""),
+                ModelOption(id: "gemini-2.5-flash", name: "Gemini 2.5 Flash", blurb: "Fast", efforts: [], defaultEffort: ""),
+                ModelOption(id: "gemini-2.5-flash-lite", name: "Flash-Lite", blurb: "Fastest", efforts: [], defaultEffort: ""),
+            ]
+        case .grok:
+            return [
+                ModelOption(id: "grok-4.7", name: "Grok 4.7", blurb: "Best edits", efforts: ["low", "medium", "high"], defaultEffort: "low"),
+                ModelOption(id: "grok-code-fast", name: "Grok Fast", blurb: "Fastest", efforts: ["low", "medium"], defaultEffort: "low"),
+            ]
         }
     }
 
@@ -260,8 +295,10 @@ final class MagicAgent: ObservableObject {
         7. Finish. Colour only when they asked for it, or when the footage clearly needs it (look at the frames): \
         shots from different cameras or light that don't match, or shots too dark or washed out. Then one look \
         from list_looks, or small set_grade fixes, on every shot so it feels like one film. Otherwise leave colour \
-        as it is, and on an existing edit don't change colour unless they asked. set_transform reframes a shot \
-        (to keep a subject in a vertical frame); set_title_style sets a title's font, size, colour and place. \
+        as it is, and on an existing edit don't change colour unless they asked. set_transform reframes, rotates, \
+        flips or adjusts opacity of a shot (to keep a subject in a vertical frame); set_crop trims a clip's four \
+        edges like an image; set_mask clips it into a rounded rectangle, ellipse or circle; set_title_style sets a \
+        title's font, size, colour and place. \
         Markers (set_marker), the in/out range, freeze frames, reversing, detaching sound, track switches and \
         solids only when they ask for them. Titles and text only when \
         they asked for them, or the kind of video needs them (a vlog's parts); most videos don't. Fade music out over the last 2 seconds. A dissolve or dip to black only where it helps, never on \
@@ -361,7 +398,12 @@ final class MagicAgent: ObservableObject {
             log("MAGIC AI \(kind.rawValue) isn't connected")
             return
         }
-        let cli: URL? = kind == .claude ? AgentConnect.shared.claudeCLI : AgentConnect.shared.codexCLI
+        let cli: URL? = switch kind {
+        case .claude: AgentConnect.shared.claudeCLI
+        case .chatgpt: AgentConnect.shared.codexCLI
+        case .gemini: AgentConnect.shared.geminiCLI
+        case .grok: AgentConnect.shared.grokCLI
+        }
         guard let cli else { return }
         self.model = model
         // What they're pointing at, before Magic locks the window and clears the selection.
@@ -388,7 +430,13 @@ final class MagicAgent: ObservableObject {
             draft = d
             status = "\(kind.name) is thinking"
             // The thinking show, driven by its tool calls (see MCPHandler).
-            MagicThinking.begin(model: model, name: kind.name, color: MCPTools.color(for: kind == .claude ? "Claude" : "ChatGPT"))
+            let cursorName: String = switch kind {
+            case .claude: "Claude"
+            case .chatgpt: "ChatGPT"
+            case .gemini: "Gemini"
+            case .grok: "Grok"
+            }
+            MagicThinking.begin(model: model, name: kind.name, color: MCPTools.color(for: cursorName))
             launch(kind, cli, url: "\(endpoint)?draft=\(d.token)", brief: Self.brief(request: request, project: model.project, pointers: pointers))
         }
     }
@@ -428,14 +476,31 @@ final class MagicAgent: ObservableObject {
         if await signedIn(kind, cli) { return true }
         let ask = EditroomAlert()
         ask.messageText = "Sign in to \(kind.name)"
-        ask.informativeText = kind == .claude
-            ? "Magic uses Claude through Claude Code on this Mac, with your Claude plan. It needs signing in once, in your browser."
-            : "Magic uses ChatGPT through Codex, which comes with the ChatGPT app, with your ChatGPT plan. It needs signing in once, in your browser."
+        ask.informativeText = switch kind {
+        case .claude:
+            "Magic uses Claude through Claude Code on this Mac, with your Claude plan. It needs signing in once, in your browser."
+        case .chatgpt:
+            "Magic uses ChatGPT through Codex, which comes with the ChatGPT app, with your ChatGPT plan. It needs signing in once, in your browser."
+        case .gemini:
+            "Magic uses Gemini CLI on this Mac. Run `gemini` once in Terminal to sign in with your Google account, then try again."
+        case .grok:
+            "Magic uses Grok CLI on this Mac, with your Grok plan. It needs signing in once, in your browser."
+        }
+        if kind == .gemini {
+            ask.addButton(withTitle: "OK")
+            ask.runModal()
+            return false
+        }
         ask.addButton(withTitle: "Sign In")
         ask.addButton(withTitle: "Cancel")
         guard ask.runModal() == .alertFirstButtonReturn else { return false }
         status = "Signing in to \(kind.name)"
-        let out = await run(cli, kind == .claude ? ["auth", "login", "--claudeai"] : ["login"])
+        let loginArgs: [String] = switch kind {
+        case .claude: ["auth", "login", "--claudeai"]
+        case .chatgpt, .grok: ["login"]
+        case .gemini: []
+        }
+        let out = await run(cli, loginArgs)
         guard !stopped else { return false }
         if await signedIn(kind, cli) { return true }
         alert("\(kind.name) isn't signed in", out.isEmpty ? "Signing in didn't finish." : String(out.prefix(600)))
@@ -443,6 +508,7 @@ final class MagicAgent: ObservableObject {
     }
 
     private func signedIn(_ kind: Kind, _ cli: URL) async -> Bool {
+        let fm = FileManager.default
         switch kind {
         case .claude:
             let out = await run(cli, ["auth", "status", "--json"])
@@ -451,6 +517,17 @@ final class MagicAgent: ObservableObject {
         case .chatgpt:
             let out = await run(cli, ["login", "status"])
             return out.localizedCaseInsensitiveContains("logged in") && !out.localizedCaseInsensitiveContains("not logged in")
+        case .gemini:
+            let home = fm.homeDirectoryForCurrentUser
+            if ProcessInfo.processInfo.environment["GEMINI_API_KEY"]?.isEmpty == false { return true }
+            return fm.fileExists(atPath: home.appendingPathComponent(".gemini/oauth_creds.json").path)
+                || fm.fileExists(atPath: home.appendingPathComponent(".gemini/google_accounts.json").path)
+        case .grok:
+            if ProcessInfo.processInfo.environment["XAI_API_KEY"]?.isEmpty == false { return true }
+            let out = await run(cli, ["usage"])
+            return !out.localizedCaseInsensitiveContains("not logged in")
+                && !out.localizedCaseInsensitiveContains("unauthorized")
+                && !out.localizedCaseInsensitiveContains("please login")
         }
     }
 
@@ -518,6 +595,30 @@ final class MagicAgent: ObservableObject {
             if !model(for: kind).isEmpty { p.arguments! += ["-m", model(for: kind)] }
             if !effort(for: kind).isEmpty { p.arguments! += ["-c", "model_reasoning_effort=\"\(effort(for: kind))\""] }
             p.arguments! += ["-"]
+        case .gemini:
+            // Project-local .gemini/settings.json binds the draft MCP URL cleanly for this run.
+            let gdir = folder.appendingPathComponent(".gemini", isDirectory: true)
+            try? fm.createDirectory(at: gdir, withIntermediateDirectories: true)
+            let cfg: [String: Any] = ["mcpServers": ["editroom": ["httpUrl": url, "trust": true, "timeout": 300_000]]]
+            if let data = try? JSONSerialization.data(withJSONObject: cfg, options: [.prettyPrinted]) {
+                try? data.write(to: gdir.appendingPathComponent("settings.json"), options: .atomic)
+            }
+            p.arguments = ["-p", brief, "-o", "stream-json", "--yolo", "--skip-trust", "--allowed-mcp-server-names", "editroom"]
+            if !model(for: kind).isEmpty { p.arguments! += ["-m", model(for: kind)] }
+        case .grok:
+            // Project-local .grok/config.toml routes Grok's MCP calls to this run's hidden draft.
+            let gdir = folder.appendingPathComponent(".grok", isDirectory: true)
+            try? fm.createDirectory(at: gdir, withIntermediateDirectories: true)
+            let toml = """
+            [mcp_servers.editroom]
+            url = \(AgentConnect.tomlString(url))
+            startup_timeout_sec = 30
+            tool_timeout_sec = 300
+            """
+            try? toml.write(to: gdir.appendingPathComponent("config.toml"), atomically: true, encoding: .utf8)
+            p.arguments = ["-p", brief, "--output-format", "streaming-json", "--always-approve", "--no-plan", "--cwd", folder.path]
+            if !model(for: kind).isEmpty { p.arguments! += ["-m", model(for: kind)] }
+            if !effort(for: kind).isEmpty { p.arguments! += ["--effort", effort(for: kind)] }
         }
         p.environment = Self.environment
         let input = Pipe(), output = Pipe(), errors = Pipe()
@@ -553,7 +654,9 @@ final class MagicAgent: ObservableObject {
             alert("Couldn't start \(kind.name)", error.localizedDescription)
             return done()
         }
-        input.fileHandleForWriting.write(Data(brief.utf8))
+        if kind == .claude || kind == .chatgpt {
+            input.fileHandleForWriting.write(Data(brief.utf8))
+        }
         try? input.fileHandleForWriting.close()
         process = p
     }
@@ -564,10 +667,19 @@ final class MagicAgent: ObservableObject {
         while let nl = pending.firstIndex(of: 0x0A) {
             let line = pending[pending.startIndex..<nl]
             pending.removeSubrange(pending.startIndex...nl)
-            guard let json = try? JSONSerialization.jsonObject(with: line) as? [String: Any] else { continue }
+            guard let json = try? JSONSerialization.jsonObject(with: line) as? [String: Any] else {
+                if kind == .gemini || kind == .grok,
+                   let plain = String(data: line, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
+                   !plain.isEmpty, !plain.hasPrefix("{") {
+                    lastMessage = plain
+                }
+                continue
+            }
             switch kind {
             case .claude: readClaude(json)
             case .chatgpt: readCodex(json)
+            case .gemini: readGemini(json)
+            case .grok: readGrok(json)
             }
         }
     }
@@ -607,6 +719,57 @@ final class MagicAgent: ObservableObject {
         }
     }
 
+    private func readGemini(_ json: [String: Any]) {
+        let type = json["type"] as? String ?? ""
+        switch type {
+        case "tool_use":
+            if let name = json["tool_name"] as? String ?? json["name"] as? String {
+                toolCalled(name.replacingOccurrences(of: "mcp__editroom__", with: ""))
+            }
+        case "message":
+            if (json["role"] as? String) == "assistant", let content = json["content"] as? String, !content.isEmpty {
+                lastMessage = content
+            }
+        case "result":
+            if let text = json["response"] as? String ?? json["result"] as? String, !text.isEmpty { lastMessage = text }
+            if (json["status"] as? String) == "error" {
+                failure = ((json["error"] as? [String: Any])?["message"] as? String) ?? "Gemini stopped."
+            }
+        case "error":
+            failure = json["message"] as? String ?? ((json["error"] as? [String: Any])?["message"] as? String) ?? failure
+        default: break
+        }
+    }
+
+    private func readGrok(_ json: [String: Any]) {
+        let type = json["type"] as? String ?? ""
+        switch type {
+        case "tool_call", "tool_use":
+            if let name = json["name"] as? String ?? (json["tool"] as? String) {
+                toolCalled(name.replacingOccurrences(of: "mcp__editroom__", with: ""))
+            }
+        case "assistant", "message":
+            if let text = json["text"] as? String ?? json["content"] as? String, !text.isEmpty {
+                lastMessage = text
+            } else if let content = (json["message"] as? [String: Any])?["content"] as? [[String: Any]] {
+                if let tool = content.last(where: { $0["type"] as? String == "tool_use" })?["name"] as? String {
+                    toolCalled(tool.replacingOccurrences(of: "mcp__editroom__", with: ""))
+                }
+                if let text = content.last(where: { $0["type"] as? String == "text" })?["text"] as? String, !text.isEmpty {
+                    lastMessage = text
+                }
+            }
+        case "result":
+            if let text = json["result"] as? String ?? json["text"] as? String, !text.isEmpty { lastMessage = text }
+            if json["is_error"] as? Bool == true {
+                failure = lastMessage.isEmpty ? "Grok stopped." : lastMessage
+            }
+        case "error":
+            failure = json["message"] as? String ?? failure
+        default: break
+        }
+    }
+
     private func toolCalled(_ tool: String) {
         guard let kind = agent else { return }
         log("MAGIC AI tool \(tool)")
@@ -625,6 +788,8 @@ final class MagicAgent: ObservableObject {
         case "add_title", "set_title_style": "titling"
         case "search_media": "searching"
         case "set_marker", "delete_markers", "set_in_out": "marking"
+        case "set_crop": "cropping"
+        case "set_mask": "masking"
         case "set_transform", "freeze_frame", "reverse_clip", "detach_audio", "duplicate_clip", "add_solid", "set_solid_color", "set_track": "editing"
         case "set_audio", "set_transition": "finishing"
         case "get_frame", "playback", "history": "checking"
