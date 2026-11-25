@@ -616,7 +616,7 @@ enum MCPTools {
     /// True when every edit only mutates visual appearance (transform/crop/mask/grade/title/solid)
     /// without altering clip timing, speed, source range, or track structure.
     private static func isVisualOnly(_ edits: [MagicEdit]) -> Bool {
-        let visualLabels: Set<String> = ["Transform", "Crop", "Mask", "Title style", "Colour"]
+        let visualLabels: Set<String> = ["Transform", "Crop", "Mask", "Background Removal", "Title style", "Colour"]
         return edits.allSatisfy { e in
             switch e {
             case .grade, .look, .type: return true
@@ -830,6 +830,17 @@ enum MCPTools {
             }
             d["transform"] = td
         }
+        if let bg = c.bgRemoval {
+            var bd: [String: Any] = [
+                "mode": bg.mode.rawValue,
+                "tolerance": round3(bg.tolerance),
+                "softness": round3(bg.softness),
+            ]
+            if abs(bg.edgeShift) > 1e-4 { bd["edge_shift"] = round3(bg.edgeShift) }
+            if bg.invert { bd["invert"] = true }
+            if bg.mode == .chromaKey { bd["key_color"] = hex(bg.keyColor) }
+            d["background_removal"] = bd
+        }
         if let g = c.grade {
             var gd: [String: Any] = [:]
             if let look = g.look { gd["look"] = g.lookLabel; if look != g.lookLabel { gd["look_file"] = look } }
@@ -943,6 +954,16 @@ extension MCPTools {
                   "corner_radius": num("Normalized corner radius for roundedRect (0...0.5, default 0.12)."),
                   "feather": num("Normalized soft edge feather (0...0.25, default 0)."),
                   "reset": ["type": "boolean", "description": "Remove the mask."]],
+                 required: ["clip_id"]),
+            tool("set_background_removal", "AI Background Removal", "Removes the background from a video or image clip using Apple Neural Engine AI segmentation (aiSubject for any subject/object, aiPerson for talking-head video) or chromaKey, with live GPU tolerance, edge softness, and edge shrink controls.",
+                 ["clip_id": str("A video or image clip's id."),
+                  "enabled": ["type": "boolean", "description": "Turn background removal on or off (default true when other params are given)."],
+                  "mode": ["type": "string", "enum": BackgroundRemovalMode.allCases.map(\.rawValue), "description": "aiSubject (any subject/object), aiPerson (human video), or chromaKey."],
+                  "tolerance": num("Cutout tolerance 0...1 (0 = strict, 0.5 = balanced, 1 = keep more foreground)."),
+                  "softness": num("Edge feather softness 0...1 (default 0.15)."),
+                  "edge_shift": num("Shrink (<0, removes edge halo) or expand (>0) matte, -1...1 (default 0)."),
+                  "invert": ["type": "boolean", "description": "Invert foreground and background."],
+                  "key_color": str("Hex colour for chromaKey mode, like #00B140.")],
                  required: ["clip_id"]),
             tool("set_title_style", "Title style", "A title's words and look. Leave out what shouldn't change.",
                  ["clip_id": str("A title clip's id."), "text": str("The words."), "font": str("A font family installed on this Mac, or \"System\"."),
@@ -1268,6 +1289,41 @@ extension MCPTools {
                 }
                 tf.clampAll()
                 q.clips[i].transform = tf.isIdentity ? nil : tf
+            }], model, who, draft)
+            return json(clipsJSON([c.id], now()))
+
+        case "set_background_removal":
+            let c = try clipArg(args, p)
+            guard c.kind == .video || c.kind == .image else {
+                throw MCPToolError("Background removal works on video and image clips.")
+            }
+            let enabled = args["enabled"] as? Bool
+            let mode = try (args["mode"] as? String).map { raw -> BackgroundRemovalMode in
+                guard let m = BackgroundRemovalMode(rawValue: raw) else {
+                    throw MCPToolError("mode is aiSubject, aiPerson or chromaKey.")
+                }
+                return m
+            }
+            let tolerance = double(args["tolerance"])
+            let softness = double(args["softness"])
+            let edgeShift = double(args["edge_shift"])
+            let invert = args["invert"] as? Bool
+            let keyColor = try colorArg(args["key_color"])
+            try await perform([.change(c.id, "Background Removal") { q in
+                guard let i = q.index(of: c.id) else { return }
+                if enabled == false {
+                    q.clips[i].bgRemoval = nil
+                    return
+                }
+                var b = q.clips[i].bgRemoval ?? BackgroundRemoval(mode: q.clips[i].kind == .video ? .aiPerson : .aiSubject)
+                if let mode { b.mode = mode }
+                if let tolerance { b.tolerance = tolerance }
+                if let softness { b.softness = softness }
+                if let edgeShift { b.edgeShift = edgeShift }
+                if let invert { b.invert = invert }
+                if let keyColor { b.keyColor = keyColor }
+                b.clampAll()
+                q.clips[i].bgRemoval = b
             }], model, who, draft)
             return json(clipsJSON([c.id], now()))
 

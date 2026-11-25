@@ -2,6 +2,7 @@ import AVFoundation
 import CoreGraphics
 import CoreImage
 import Metal
+import Vision
 
 /// Thread-safe cache of the most recently decoded raw source frames at a timeline time,
 /// allowing instant (<5ms) GPU re-compositing during interactive drag/crop/transform/grade edits
@@ -31,6 +32,245 @@ final class LiveFrameCache: @unchecked Sendable {
         cachedTime = -1
         frames.removeAll()
         lock.unlock()
+        BackgroundMatteEngine.clearCache()
+    }
+}
+
+/// Hardware-accelerated Apple Silicon Neural Engine (Vision) + Metal GPU background removal engine.
+/// Caches raw Vision mattes per `(clipID, frame, mode, size)` so adjusting Tolerance, Softness,
+/// Edge Shift, or Invert re-runs purely on the GPU in <3ms without re-invoking Vision.
+final class BackgroundMatteEngine: @unchecked Sendable {
+    private struct MatteKey: Hashable {
+        let clipID: UUID
+        let frameBucket: Int
+        let mode: BackgroundRemovalMode
+        let width: Int
+        let height: Int
+    }
+
+    private struct ChromaKey: Hashable {
+        let r: Int, g: Int, b: Int
+        let tolerance: Int
+        let softness: Int
+        let invert: Bool
+    }
+
+    private static let lock = NSLock()
+    private static var matteCache: [MatteKey: CIImage] = [:]
+    private static var matteOrder: [MatteKey] = []
+    private static var chromaCache: [ChromaKey: Data] = [:]
+    private static let maxMattes = 90
+
+    static func clearCache() {
+        lock.lock()
+        matteCache.removeAll()
+        matteOrder.removeAll()
+        lock.unlock()
+    }
+
+    static func apply(_ bg: BackgroundRemoval, to image: CIImage, clipID: UUID, at t: Double, isStill: Bool) -> CIImage {
+        let extent = image.extent
+        guard !extent.isInfinite, extent.width > 1, extent.height > 1 else { return image }
+
+        if bg.mode == .chromaKey {
+            let cube = chromaCube(color: bg.keyColor, tolerance: bg.tolerance, softness: bg.softness, invert: bg.invert)
+            let keyed = image.applyingFilter("CIColorCube", parameters: [
+                "inputCubeDimension": 32,
+                "inputCubeData": cube,
+            ]).cropped(to: extent)
+            if abs(bg.edgeShift) < 0.01 { return keyed }
+            // Apply edge shrink/expand to the keyed alpha when requested.
+            var alphaMask = keyed.applyingFilter("CIColorMatrix", parameters: [
+                "inputRVector": CIVector(x: 0, y: 0, z: 0, w: 1),
+                "inputGVector": CIVector(x: 0, y: 0, z: 0, w: 1),
+                "inputBVector": CIVector(x: 0, y: 0, z: 0, w: 1),
+                "inputAVector": CIVector(x: 0, y: 0, z: 0, w: 0),
+                "inputBiasVector": CIVector(x: 0, y: 0, z: 0, w: 1),
+            ]).cropped(to: extent)
+            if bg.edgeShift < -0.01 {
+                alphaMask = alphaMask.applyingFilter("CIMorphologyMinimum", parameters: [kCIInputRadiusKey: abs(bg.edgeShift) * 6.0]).cropped(to: extent)
+            } else {
+                alphaMask = alphaMask.applyingFilter("CIMorphologyMaximum", parameters: [kCIInputRadiusKey: bg.edgeShift * 6.0]).cropped(to: extent)
+            }
+            let clear = CIImage(color: .clear).cropped(to: extent)
+            return image.applyingFilter("CIBlendWithMask", parameters: [
+                kCIInputBackgroundImageKey: clear,
+                kCIInputMaskImageKey: alphaMask,
+            ]).cropped(to: extent)
+        }
+
+        // AI Neural Segmentation (Vision Framework on Apple Silicon Neural Engine).
+        let key = MatteKey(clipID: clipID,
+                           frameBucket: isStill ? 0 : Int((t * 60.0).rounded()),
+                           mode: bg.mode,
+                           width: Int(extent.width.rounded()),
+                           height: Int(extent.height.rounded()))
+        let rawMatte: CIImage?
+        lock.lock()
+        let cached = matteCache[key]
+        lock.unlock()
+
+        if let cached {
+            rawMatte = cached
+        } else {
+            let computed = computeVisionMatte(for: image, mode: bg.mode)
+            if let computed {
+                lock.lock()
+                matteCache[key] = computed
+                matteOrder.append(key)
+                if matteOrder.count > maxMattes {
+                    let drop = matteOrder.removeFirst()
+                    matteCache.removeValue(forKey: drop)
+                }
+                lock.unlock()
+            }
+            rawMatte = computed
+        }
+
+        guard let raw = rawMatte, raw.extent.width > 0, raw.extent.height > 0 else { return image }
+
+        // Map raw Vision matte cleanly onto `image.extent`.
+        let sx = extent.width / raw.extent.width
+        let sy = extent.height / raw.extent.height
+        var matte = raw.transformed(by: CGAffineTransform(scaleX: sx, y: sy)
+            .concatenating(CGAffineTransform(translationX: extent.minX - raw.extent.minX * sx,
+                                             y: extent.minY - raw.extent.minY * sy)))
+            .cropped(to: extent)
+
+        // 1. Edge shrink / expand (kills background spill halo when negative).
+        if bg.edgeShift < -0.01 {
+            let r = CGFloat(abs(bg.edgeShift) * 6.0)
+            let pad = ceil(r) + 2
+            let black = CIImage(color: .black).cropped(to: extent.insetBy(dx: -pad, dy: -pad))
+            matte = matte.composited(over: black)
+                .applyingFilter("CIMorphologyMinimum", parameters: [kCIInputRadiusKey: r])
+                .cropped(to: extent)
+        } else if bg.edgeShift > 0.01 {
+            let r = CGFloat(bg.edgeShift * 6.0)
+            matte = matte.applyingFilter("CIMorphologyMaximum", parameters: [kCIInputRadiusKey: r])
+                .cropped(to: extent)
+        }
+
+        // 2. Tolerance control: shifts neural alpha decision boundary in real time on the GPU.
+        // tolerance 0.0 -> strict (0.88), tolerance 0.5 -> balanced (0.49), tolerance 1.0 -> permissive (0.10).
+        let threshold = 0.88 - bg.tolerance.clamped(to: 0...1) * 0.78
+        let slope = 7.5 - bg.softness.clamped(to: 0...1) * 5.0
+        let bias = 0.5 - threshold * slope
+        matte = matte
+            .applyingFilter("CIColorMatrix", parameters: [
+                "inputRVector": CIVector(x: slope, y: 0, z: 0, w: 0),
+                "inputGVector": CIVector(x: slope, y: 0, z: 0, w: 0),
+                "inputBVector": CIVector(x: slope, y: 0, z: 0, w: 0),
+                "inputAVector": CIVector(x: 0, y: 0, z: 0, w: 1),
+                "inputBiasVector": CIVector(x: bias, y: bias, z: bias, w: 0),
+            ])
+            .applyingFilter("CIColorClamp", parameters: [
+                "inputMinComponents": CIVector(x: 0, y: 0, z: 0, w: 0),
+                "inputMaxComponents": CIVector(x: 1, y: 1, z: 1, w: 1),
+            ])
+            .cropped(to: extent)
+
+        // 3. Softness / feathering without edge seam.
+        if bg.softness > 0.01 {
+            let radius = CGFloat(bg.softness.clamped(to: 0...1) * 7.0)
+            let pad = ceil(radius * 3)
+            let black = CIImage(color: .black).cropped(to: extent.insetBy(dx: -pad, dy: -pad))
+            matte = matte.composited(over: black)
+                .applyingFilter("CIGaussianBlur", parameters: [kCIInputRadiusKey: radius])
+                .cropped(to: extent)
+        }
+
+        // 4. Optional invert.
+        if bg.invert {
+            matte = matte.applyingFilter("CIColorInvert").cropped(to: extent)
+        }
+
+        let clear = CIImage(color: .clear).cropped(to: extent)
+        return image.applyingFilter("CIBlendWithMask", parameters: [
+            kCIInputBackgroundImageKey: clear,
+            kCIInputMaskImageKey: matte,
+        ]).cropped(to: extent)
+    }
+
+    /// Runs Apple Vision segmentation on the Neural Engine and returns a normalized grayscale `CIImage` matte.
+    private static func computeVisionMatte(for image: CIImage, mode: BackgroundRemovalMode) -> CIImage? {
+        let e = image.extent
+        let normalized = image.transformed(by: CGAffineTransform(translationX: -e.minX, y: -e.minY))
+        // Cap Vision input at 1024px long side so 4K video stays fast on the Neural Engine while keeping crisp mattes.
+        let maxSide = max(e.width, e.height)
+        let visionInput: CIImage
+        if maxSide > 1024 {
+            let s = 1024 / maxSide
+            visionInput = normalized.transformed(by: CGAffineTransform(scaleX: s, y: s))
+        } else {
+            visionInput = normalized
+        }
+
+        let handler = VNImageRequestHandler(ciImage: visionInput, options: [.ciContext: TimelineCompositor.context])
+
+        if mode == .aiSubject {
+            let req = VNGenerateForegroundInstanceMaskRequest()
+            if (try? handler.perform([req])) != nil,
+               let obs = req.results?.first,
+               !obs.allInstances.isEmpty,
+               let maskBuf = try? obs.generateScaledMaskForImage(forInstances: obs.allInstances, from: handler) {
+                return CIImage(cvPixelBuffer: maskBuf)
+            }
+            // Fall through to person segmentation if no discrete subject instance was found.
+        }
+
+        let personReq = VNGeneratePersonSegmentationRequest()
+        personReq.qualityLevel = .accurate
+        personReq.outputPixelFormat = kCVPixelFormatType_OneComponent8
+        guard (try? handler.perform([personReq])) != nil,
+              let obs = personReq.results?.first else { return nil }
+        return CIImage(cvPixelBuffer: obs.pixelBuffer)
+    }
+
+    /// Cached 32x32x32 3D color-distance LUT for GPU Color / Chroma Key.
+    private static func chromaCube(color: RGBA, tolerance: Double, softness: Double, invert: Bool) -> Data {
+        let key = ChromaKey(r: Int((color.r * 255).rounded()),
+                            g: Int((color.g * 255).rounded()),
+                            b: Int((color.b * 255).rounded()),
+                            tolerance: Int((tolerance * 200).rounded()),
+                            softness: Int((softness * 200).rounded()),
+                            invert: invert)
+        lock.lock()
+        if let hit = chromaCache[key] { lock.unlock(); return hit }
+        lock.unlock()
+
+        let dim = 32
+        var data = [Float](repeating: 0, count: dim * dim * dim * 4)
+        let kr = Float(color.r), kg = Float(color.g), kb = Float(color.b)
+        let thresh = Float(0.04 + tolerance.clamped(to: 0...1) * 0.72)
+        let feather = Float(max(0.015, softness.clamped(to: 0...1) * 0.35))
+
+        var idx = 0
+        for b in 0..<dim {
+            let bf = Float(b) / Float(dim - 1)
+            for g in 0..<dim {
+                let gf = Float(g) / Float(dim - 1)
+                for r in 0..<dim {
+                    let rf = Float(r) / Float(dim - 1)
+                    let dr = rf - kr, dg = gf - kg, db = bf - kb
+                    let dist = sqrt(dr * dr + dg * dg + db * db)
+                    var a = min(1, max(0, (dist - thresh) / feather))
+                    a = a * a * (3 - 2 * a)
+                    if invert { a = 1 - a }
+                    data[idx] = rf * a
+                    data[idx + 1] = gf * a
+                    data[idx + 2] = bf * a
+                    data[idx + 3] = a
+                    idx += 4
+                }
+            }
+        }
+        let result = data.withUnsafeBufferPointer { Data(buffer: $0) }
+        lock.lock()
+        if chromaCache.count > 64 { chromaCache.removeAll() }
+        chromaCache[key] = result
+        lock.unlock()
+        return result
     }
 }
 
@@ -80,6 +320,7 @@ struct RenderLayer {
     /// How the source file's picture is encoded; HDR and Log are converted to Rec.709 first.
     let color: SourceColor
     let transform: ClipTransform?
+    let bgRemoval: BackgroundRemoval?
     /// A video layer's place in its file, for scrubbing from made-ahead frames (nil: not from them).
     let scrub: ScrubSource?
 
@@ -90,6 +331,7 @@ struct RenderLayer {
         self.cube = cube
         self.color = color
         transform = clip.transform.flatMap { $0.isIdentity ? nil : $0 }
+        bgRemoval = clip.bgRemoval
         start = clip.start - plan.leadIn
         end = clip.end + plan.tailOut
         fadeStart = clip.start
@@ -343,21 +585,27 @@ final class TimelineCompositor: NSObject, AVVideoCompositing {
             if let w = layer.wipe(at: t) {
                 image = image.cropped(to: CGRect(x: 0, y: 0, width: size.width * w, height: size.height))
             }
-            if let tf = layer.transform {
-                // 1. Flip H/V about the fitted clip's centre.
-                if tf.flipH || tf.flipV {
-                    let bcx = baseRect.midX, bcy = baseRect.midY
-                    let flip = CGAffineTransform(translationX: -bcx, y: -bcy)
-                        .concatenating(CGAffineTransform(scaleX: tf.flipH ? -1 : 1, y: tf.flipV ? -1 : 1))
-                        .concatenating(CGAffineTransform(translationX: bcx, y: bcy))
-                    image = image.transformed(by: flip)
-                }
-                // 2. Real 4-side crop in fitted clip space.
-                let cropRect = tf.croppedRect(in: baseRect, yUp: true)
-                if tf.hasCrop {
-                    image = image.cropped(to: cropRect)
-                }
-                // 3. Mask (rounded corners / ellipse / circle + feather) inside cropped rect.
+            let tf = layer.transform
+            let isStill: Bool = { if case .image = layer.source { return true }; return false }()
+            // 1. Flip H/V about the fitted clip's centre.
+            if let tf, tf.flipH || tf.flipV {
+                let bcx = baseRect.midX, bcy = baseRect.midY
+                let flip = CGAffineTransform(translationX: -bcx, y: -bcy)
+                    .concatenating(CGAffineTransform(scaleX: tf.flipH ? -1 : 1, y: tf.flipV ? -1 : 1))
+                    .concatenating(CGAffineTransform(translationX: bcx, y: bcy))
+                image = image.transformed(by: flip)
+            }
+            // 2. Real 4-side crop in fitted clip space.
+            let cropRect = tf?.croppedRect(in: baseRect, yUp: true) ?? baseRect
+            if let tf, tf.hasCrop {
+                image = image.cropped(to: cropRect)
+            }
+            // 3. AI Background Removal / Chroma Key (runs after crop so Vision focuses on the kept region).
+            if let bg = layer.bgRemoval {
+                image = BackgroundMatteEngine.apply(bg, to: image, clipID: layer.clipID, at: t, isStill: isStill)
+            }
+            if let tf {
+                // 4. Geometric Mask (rounded corners / ellipse / circle + feather) inside cropped rect.
                 if tf.hasMask, let mask = makeMask(rect: cropRect, shape: tf.maskShape,
                                                    cornerRadius: tf.cornerRadius, feather: tf.maskFeather) {
                     let clear = CIImage(color: .clear).cropped(to: cropRect)
@@ -366,7 +614,7 @@ final class TimelineCompositor: NSObject, AVVideoCompositing {
                         kCIInputMaskImageKey: mask,
                     ]).cropped(to: cropRect)
                 }
-                // 4. Scale, rotate and offset using the shared transform matrix (Preview == Export == HitTest).
+                // 5. Scale, rotate and offset using the shared transform matrix (Preview == Export == HitTest).
                 if abs(tf.scale - 1) > 1e-6 || abs(tf.rotation) > 1e-6 || abs(tf.x) > 1e-6 || abs(tf.y) > 1e-6 {
                     image = image.transformed(by: tf.affine(canvasSize: size, yUp: true))
                 }

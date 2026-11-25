@@ -303,6 +303,10 @@ struct InspectorView: View {
         } else if visual.count == 1, visual[0].kind == .text {
             textTransformSection(visual[0])
         }
+        let cuttable = visual.filter { $0.kind == .video || $0.kind == .image }
+        if !cuttable.isEmpty {
+            backgroundRemovalSection(cuttable)
+        }
         if visual.count == 1 { transitionSection(visual[0]) }
         if !visual.isEmpty { fadeSection(audio.isEmpty ? "Fade" : "Video fade", visual) }
         if !audio.isEmpty { fadeSection(visual.isEmpty ? "Fade" : "Audio fade", audio) }
@@ -473,6 +477,142 @@ struct InspectorView: View {
                 ParamRow(icon: .symbol("aqi.medium"), label: "Feather", value: tf.maskFeather * 100,
                          range: 0...25, step: 0.5, format: Self.percentTenths, onEditing: done,
                          onChange: { v in live { $0.maskFeather = (v / 100).clamped(to: ClipTransform.featherRange) } })
+            }
+        }
+    }
+
+    @ViewBuilder private func backgroundRemovalSection(_ clips: [Clip]) -> some View {
+        let ids = Set(clips.map(\.id))
+        let current = clips[0].bgRemoval
+        let active = current != nil
+        let bg = current ?? BackgroundRemoval(mode: clips[0].kind == .video ? .aiPerson : .aiSubject)
+        let live: (@escaping (inout BackgroundRemoval) -> Void) -> Void = { body in
+            model.liveVisual(autoCommit: false) { p in
+                for i in p.clips.indices where ids.contains(p.clips[i].id) {
+                    var b = p.clips[i].bgRemoval ?? BackgroundRemoval(mode: p.clips[i].kind == .video ? .aiPerson : .aiSubject)
+                    body(&b)
+                    b.clampAll()
+                    p.clips[i].bgRemoval = b
+                }
+            }
+        }
+        let done: (Bool) -> Void = { if !$0 { model.commitLive() } }
+        InspectorSection("Background Removal", action: active ? ("Off", {
+            model.mutate { p in
+                for i in p.clips.indices where ids.contains(p.clips[i].id) { p.clips[i].bgRemoval = nil }
+            }
+        }) : nil, collapsedByDefault: !active, marked: active) {
+            HStack(spacing: 8) {
+                Image(systemName: "person.and.background.dotted")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(active ? Color(hex: 0x38BDF8) : Theme.textDim)
+                    .frame(width: 18)
+                Text("Remove BG")
+                    .font(.system(size: 11.5))
+                    .foregroundStyle(Theme.text)
+                Spacer()
+                Toggle("", isOn: Binding(
+                    get: { active },
+                    set: { on in
+                        model.mutate { p in
+                            for i in p.clips.indices where ids.contains(p.clips[i].id) {
+                                p.clips[i].bgRemoval = on ? BackgroundRemoval(mode: p.clips[i].kind == .video ? .aiPerson : .aiSubject) : nil
+                            }
+                        }
+                        AppleHaptics.click()
+                    }
+                ))
+                .toggleStyle(.switch)
+                .labelsHidden()
+                .controlSize(.small)
+                .tint(Color(hex: 0x38BDF8))
+            }
+            if active {
+                HStack(spacing: 8) {
+                    Image(systemName: "sparkles")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(Theme.textDim)
+                        .frame(width: 18)
+                    Text("Engine")
+                        .font(.system(size: 11.5))
+                        .foregroundStyle(Theme.text)
+                        .frame(width: 52, alignment: .leading)
+                    MenuField(label: bg.mode.label, height: 26) {
+                        ForEach(BackgroundRemovalMode.allCases, id: \.self) { mode in
+                            Button(mode.label) {
+                                model.mutate { p in
+                                    for i in p.clips.indices where ids.contains(p.clips[i].id) {
+                                        var b = p.clips[i].bgRemoval ?? BackgroundRemoval()
+                                        b.mode = mode
+                                        p.clips[i].bgRemoval = b
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if bg.mode == .chromaKey {
+                    HStack(spacing: 8) {
+                        Image(systemName: "eyedropper")
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundStyle(Theme.textDim)
+                            .frame(width: 18)
+                        Text("Key Color")
+                            .font(.system(size: 11.5))
+                            .foregroundStyle(Theme.text)
+                        Spacer()
+                        HStack(spacing: 4) {
+                            ForEach([
+                                ("Green", RGBA(r: 0, g: 0.694, b: 0.251, a: 1)),
+                                ("Blue", RGBA(r: 0, g: 0.278, b: 0.733, a: 1)),
+                                ("White", RGBA(r: 1, g: 1, b: 1, a: 1)),
+                                ("Black", RGBA(r: 0, g: 0, b: 0, a: 1)),
+                            ], id: \.0) { swatch in
+                                Circle()
+                                    .fill(swatch.1.color)
+                                    .overlay(Circle().strokeBorder(Theme.ink.opacity(0.35), lineWidth: 1))
+                                    .frame(width: 14, height: 14)
+                                    .onTapGesture {
+                                        model.liveVisual(autoCommit: true) { p in
+                                            for i in p.clips.indices where ids.contains(p.clips[i].id) {
+                                                p.clips[i].bgRemoval?.keyColor = swatch.1
+                                            }
+                                        }
+                                    }
+                                    .help(swatch.0)
+                            }
+                            ColorPicker("", selection: Binding(
+                                get: { bg.keyColor.color },
+                                set: { col in
+                                    model.liveVisual(autoCommit: true) { p in
+                                        for i in p.clips.indices where ids.contains(p.clips[i].id) {
+                                            p.clips[i].bgRemoval?.keyColor = RGBA(col)
+                                        }
+                                    }
+                                }
+                            ), supportsOpacity: false)
+                            .labelsHidden()
+                        }
+                    }
+                }
+                ParamRow(icon: .symbol("slider.horizontal.3"), label: "Tolerance", value: bg.tolerance * 100,
+                         range: 0...100, step: 1, format: Self.percentTenths, onEditing: done,
+                         onChange: { v in live { $0.tolerance = v / 100 } })
+                ParamRow(icon: .symbol("aqi.medium"), label: "Softness", value: bg.softness * 100,
+                         range: 0...100, step: 1, format: Self.percentTenths, onEditing: done,
+                         onChange: { v in live { $0.softness = v / 100 } })
+                ParamRow(icon: .symbol("arrow.left.and.right"), label: "Edge", value: bg.edgeShift * 100,
+                         range: -100...100, step: 1, format: { "\(Int($0.rounded()))%" }, onEditing: done,
+                         onChange: { v in live { $0.edgeShift = v / 100 } })
+                HStack(spacing: 8) {
+                    Chip(label: "Invert Mask", active: bg.invert) {
+                        model.mutate { p in
+                            for i in p.clips.indices where ids.contains(p.clips[i].id) {
+                                p.clips[i].bgRemoval?.invert.toggle()
+                            }
+                        }
+                    }
+                }
             }
         }
     }

@@ -104,6 +104,8 @@ struct Clip: Identifiable, Codable, Hashable {
     var grade: ColorGrade?
     /// Size and placement for video, image and solid clips; nil means fitted to the frame.
     var transform: ClipTransform?
+    /// AI background removal / chroma key for video and image clips; nil means untouched.
+    var bgRemoval: BackgroundRemoval?
     /// A transition into this clip from the clip that ends where it starts, on the same track.
     var transitionIn: Transition?
     /// A freeze frame: shows the single frame at `sourceStart` for its whole length.
@@ -218,6 +220,47 @@ enum MaskShape: String, Codable, CaseIterable, Hashable {
         case .ellipse: return "Ellipse"
         case .circle: return "Circle"
         }
+    }
+}
+
+/// How background removal isolates the foreground subject of a video or photo clip.
+enum BackgroundRemovalMode: String, Codable, Hashable, CaseIterable {
+    /// Apple Neural Engine subject segmentation (`VNGenerateForegroundInstanceMaskRequest`) —
+    /// lifts any foreground object, person, logo or product cleanly.
+    case aiSubject
+    /// Apple Neural Engine dedicated human/presenter segmentation (`VNGeneratePersonSegmentationRequest`) —
+    /// smooth real-time cutout tailored for talking-head video.
+    case aiPerson
+    /// GPU Color / Chroma Key for green screen, blue screen, or solid backgrounds.
+    case chromaKey
+
+    var label: String {
+        switch self {
+        case .aiSubject: return "AI Subject (Auto)"
+        case .aiPerson: return "AI Person (Video)"
+        case .chromaKey: return "Color Key"
+        }
+    }
+}
+
+/// Per-clip AI background removal / chroma key settings with live GPU tolerance and edge controls.
+struct BackgroundRemoval: Codable, Hashable {
+    var mode: BackgroundRemovalMode = .aiSubject
+    /// Tolerance (`0...1`, default `0.5`): lower = stricter cutout, higher = keeps more edge/foreground detail.
+    var tolerance: Double = 0.5
+    /// Edge softness / feathering (`0...1`, default `0.15`).
+    var softness: Double = 0.15
+    /// Edge shrink / expand (`-1...1`, default `0`; negative trims edge halos inward, positive expands).
+    var edgeShift: Double = 0.0
+    /// Inverts foreground and background.
+    var invert: Bool = false
+    /// Target color when `mode == .chromaKey` (default studio green #00B140).
+    var keyColor: RGBA = RGBA(r: 0.0, g: 0.694, b: 0.251, a: 1.0)
+
+    mutating func clampAll() {
+        tolerance = tolerance.clamped(to: 0...1)
+        softness = softness.clamped(to: 0...1)
+        edgeShift = edgeShift.clamped(to: -1...1)
     }
 }
 

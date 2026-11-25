@@ -966,6 +966,7 @@ final class MagicAgent: ObservableObject {
         case "set_marker", "delete_markers", "set_in_out": "marking"
         case "set_crop": "cropping"
         case "set_mask": "masking"
+        case "set_background_removal": "removing background"
         case "set_transform", "freeze_frame", "reverse_clip", "detach_audio", "duplicate_clip", "add_solid", "set_solid_color", "set_track": "editing"
         case "set_audio", "set_transition": "finishing"
         case "get_frame", "playback", "history": "checking"

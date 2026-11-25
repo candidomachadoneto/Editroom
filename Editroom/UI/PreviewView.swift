@@ -747,6 +747,19 @@ private struct CanvasQuickBar: View {
                 .font(.system(size: 11))
                 .foregroundStyle(Theme.textDim)
             Spacer(minLength: 8)
+            if clip.kind == .video || clip.kind == .image {
+                quickBtn(symbol: "person.and.background.dotted", label: "Remove BG", active: clip.bgRemoval != nil) {
+                    model.mutate { p in
+                        guard let i = p.index(of: clip.id) else { return }
+                        if p.clips[i].bgRemoval != nil {
+                            p.clips[i].bgRemoval = nil
+                        } else {
+                            p.clips[i].bgRemoval = BackgroundRemoval(mode: p.clips[i].kind == .video ? .aiPerson : .aiSubject)
+                        }
+                    }
+                    AppleHaptics.click()
+                }
+            }
             quickBtn(symbol: "arrow.left.and.right.righttriangle.left.righttriangle.right", label: "Flip H", active: tf.flipH) {
                 apply { $0.flipH.toggle() }
             }
